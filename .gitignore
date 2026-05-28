@@ -1,0 +1,24 @@
+# Dependencies + build output
+node_modules/
+dist/
+
+# Per-run output (audit records, calldata bundles)
+runs/
+
+# Operator's real config (contains RPC URL with API key) — only the example
+# config under examples/ is tracked.
+config.yaml
+*.local.yaml
+
+# Env
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# AI
+.claude
