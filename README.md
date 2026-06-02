@@ -1,5 +1,8 @@
 # aztec-staking-payout
 
+> [!WARNING]
+> This code is **not audited** and may contain bugs. Use at your own risk.
+
 A small command-line tool Aztec sequencer operators run **once a week** to pay their delegators a share of the rewards they collected — at a commission rate the operator chooses, without redeploying any contracts.
 
 **The problem it solves.** Provider commission rates in the Aztec staking protocol are baked into each delegation's coinbase split contract and **cannot be changed**. If your operating costs rise, you have no way to adjust the effective commission on delegations that already exist.
