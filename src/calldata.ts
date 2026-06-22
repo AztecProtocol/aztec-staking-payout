@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { encodeFunctionData, type Address } from "viem"
-import type { DistributionEntry, PlannedTx } from "./types.js"
+import type { DistributionEntry, OutputMode, PlannedTx } from "./types.js"
 
 /** Multicall3 ABI — only the function we need. */
 const MULTICALL3_ABI = [
@@ -46,68 +46,155 @@ const ERC20_TRANSFER_ABI = [
   },
 ] as const
 
+const ERC20_TRANSFER_FROM_ABI = [
+  {
+    name: "transferFrom",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "from", type: "address" },
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const
+
+const ERC20_APPROVE_ABI = [
+  {
+    name: "approve",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const
+
 interface BuildPlannedTxsInput {
   multicall3: Address
   token: Address
   entries: DistributionEntry[]
+  outputMode: OutputMode
+  /** The wallet holding the tokens. In `multicall` mode this is the `from`
+   *  argument to `transferFrom`. Ignored in `safe` mode. */
+  distributionWallet: Address
+  /** Current ERC20 allowance the distribution wallet has granted Multicall3.
+   *  In `multicall` mode the approve tx is omitted when `>= total`. Ignored
+   *  in `safe` mode. */
+  currentAllowance: bigint
 }
 
 /**
  * Build the ordered list of planned txs for a settlement.
  *
- *   1. A single Multicall3.aggregate3 with N inner ERC20.transfer calls.
+ * Shape depends on `outputMode`:
  *
- * The transfer amount is already rate-adjusted at build time (see
- * `buildDistribution` in attribution.ts) — there is no contract to apply
- * the rate server-side.
+ *   - "safe":      N planned txs, each `ERC20.transfer(delegator, amount)`
+ *                  targeting the token directly. The Safe wraps them in
+ *                  MultiSend at submission, so `msg.sender == Safe` on every
+ *                  inner transfer and tokens flow from the Safe.
  *
- * `allowFailure` is set to FALSE on every inner call — we want the whole
- * batch to revert atomically if any single transfer fails. A partial
- * settlement is a recovery nightmare (which delegators got paid? which
- * didn't? in what order?). Multicall3's atomicity is what guarantees the
- * batch is "all or nothing".
+ *   - "multicall": 1 or 2 planned txs targeting first the token (optional
+ *                  `approve(Multicall3, total)`) and then Multicall3
+ *                  (`aggregate3([transferFrom(wallet, delegator, amount),
+ *                  ...])`). The approve is skipped when `currentAllowance >=
+ *                  total`. The aggregate3 step is atomic: any inner failure
+ *                  reverts the whole batch.
  *
- * Returns an empty array if there are no entries — caller decides whether
- * to send a no-op tx (don't) or log and exit (do).
+ * Amounts are already rate-adjusted at build time (see `buildDistribution` /
+ * `buildWeightedDistribution` in attribution.ts).
+ *
+ * Returns an empty array if there are no entries — caller decides whether to
+ * send a no-op tx (don't) or log and exit (do).
  */
 export function buildPlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
-  const { multicall3, token, entries } = input
+  const { entries, outputMode } = input
   if (entries.length === 0) return []
+  return outputMode === "safe"
+    ? buildSafePlannedTxs(input)
+    : buildMulticallPlannedTxs(input)
+}
+
+function buildSafePlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
+  const { token, entries } = input
+  return entries.map((e, i) => ({
+    label: `ERC20.transfer #${i + 1}/${entries.length} → ${e.delegator} (${e.amount})`,
+    to: token,
+    value: 0n,
+    data: encodeFunctionData({
+      abi: ERC20_TRANSFER_ABI,
+      functionName: "transfer",
+      args: [e.delegator, e.amount],
+    }),
+    function: "transfer",
+    args: {
+      token,
+      delegator: e.delegator,
+      amount: e.amount.toString(),
+      preRateShare: e.preRateShare.toString(),
+    },
+  }))
+}
+
+function buildMulticallPlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
+  const { multicall3, token, entries, distributionWallet, currentAllowance } = input
+  const total = entries.reduce((acc, e) => acc + e.amount, 0n)
+  const planned: PlannedTx[] = []
+
+  if (currentAllowance < total) {
+    planned.push({
+      label: `ERC20.approve(Multicall3, ${total})`,
+      to: token,
+      value: 0n,
+      data: encodeFunctionData({
+        abi: ERC20_APPROVE_ABI,
+        functionName: "approve",
+        args: [multicall3, total],
+      }),
+      function: "approve",
+      args: {
+        token,
+        spender: multicall3,
+        amount: total.toString(),
+      },
+    })
+  }
 
   const innerCalls = entries.map((e) => ({
     target: token,
     allowFailure: false,
     callData: encodeFunctionData({
-      abi: ERC20_TRANSFER_ABI,
-      functionName: "transfer",
-      args: [e.delegator, e.amount],
+      abi: ERC20_TRANSFER_FROM_ABI,
+      functionName: "transferFrom",
+      args: [distributionWallet, e.delegator, e.amount],
     }),
   }))
 
-  return [
-    {
-      label: `multicall3.aggregate3(${entries.length} transfers)`,
-      to: multicall3,
-      value: 0n,
-      data: encodeFunctionData({
-        abi: MULTICALL3_ABI,
-        functionName: "aggregate3",
-        args: [innerCalls],
-      }),
-      function: "aggregate3",
-      args: {
-        // Per-delegator breakdown for the audit record + cold-wallet bundle.
-        // A signer reviewing this should see the per-recipient amounts, not
-        // just an opaque calldata blob.
-        token,
-        transfers: entries.map((e) => ({
-          delegator: e.delegator,
-          amount: e.amount.toString(),
-          preRateShare: e.preRateShare.toString(),
-        })),
-      },
+  planned.push({
+    label: `Multicall3.aggregate3(${entries.length} transferFrom calls)`,
+    to: multicall3,
+    value: 0n,
+    data: encodeFunctionData({
+      abi: MULTICALL3_ABI,
+      functionName: "aggregate3",
+      args: [innerCalls],
+    }),
+    function: "aggregate3",
+    args: {
+      from: distributionWallet,
+      token,
+      transfers: entries.map((e) => ({
+        delegator: e.delegator,
+        amount: e.amount.toString(),
+        preRateShare: e.preRateShare.toString(),
+      })),
     },
-  ]
+  })
+
+  return planned
 }
 
 /** Planned transaction in the JSON-friendly shape used in the audit record. */

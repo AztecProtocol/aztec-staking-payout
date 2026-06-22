@@ -17,7 +17,7 @@ import { countProposalsByProposer } from "./proposals.js"
 import { computeGasSpent } from "./gascost.js"
 import { resolveEpochRange, type EpochRange } from "./epochs.js"
 import { createInlineProgress } from "./progress.js"
-import type { AttributionMode } from "./types.js"
+import type { AttributionMode, OutputMode } from "./types.js"
 import {
   formatPlanForHumans,
   newRunId,
@@ -33,6 +33,19 @@ const ERC20_BALANCE_OF_ABI = [
     type: "function",
     stateMutability: "view",
     inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const
+
+const ERC20_ALLOWANCE_ABI = [
+  {
+    name: "allowance",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
     outputs: [{ name: "", type: "uint256" }],
   },
 ] as const
@@ -105,6 +118,14 @@ export interface SettleOptions {
    *  Useful for what-if sizing and as the *only* way to drive equal-split
    *  mode, which has no proposal count to multiply by. */
   simulateReward: bigint | null
+  /** Output shape for the planned transactions. `null` means "auto":
+   *  `safe` for `--emit-calldata` (Safes can't use Multicall3 for ERC20
+   *  transfers — `msg.sender` inside aggregate3 is Multicall3, which holds
+   *  no tokens, so the inner transfer reverts), `multicall` for live
+   *  broadcast (a plain EOA gets fewer txs by approving once and aggregating
+   *  transferFrom calls). Cold-wallet EOAs reading the audit JSON can pick
+   *  either by passing this flag explicitly. */
+  outputMode: OutputMode | null
 }
 
 export interface SettleResult {
@@ -125,7 +146,14 @@ export interface SettleResult {
  *   3. Discover active delegators from on-chain (or use config override).
  *   4. Count checkpoints each attester proposed within the epoch range.
  *   5. Proposal-weighted split + commission; or equal-split (override path).
- *   6. Build a single Multicall3 batch of ERC20.transfer calls.
+ *   6. Build planned txs in the chosen output mode:
+ *        - "safe":      N top-level `ERC20.transfer` calls (one per
+ *          delegator). Safe wraps them in MultiSend; works for Safes,
+ *          smart-account wallets, and cold-wallet EOAs signing one by one.
+ *        - "multicall": optional `ERC20.approve(Multicall3, total)` + one
+ *          `Multicall3.aggregate3([transferFrom, ...])`. Fewer txs but
+ *          requires the wallet to be a plain EOA (Safes can't use this —
+ *          inner transfer reverts with insufficient balance on Multicall3).
  *   7. Branch on output mode (dry-run / emit-calldata / live).
  *   8. Write audit record.
  */
@@ -249,6 +277,24 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   const safeImportPathOverride = manualOverride ? null : opts.safeImportPath
   const willSend = !dryRun && !emitSafeImport
 
+  // Output-mode selection. Explicit > auto. Auto: `safe` whenever the user
+  // asked for an importable bundle (`--emit-calldata`); `multicall` for live
+  // broadcast (an EOA gets to settle a whole period in two txs). Safes
+  // *cannot* use `multicall` — Multicall3 becomes `msg.sender` on each inner
+  // ERC20.transfer and reverts with insufficient balance because Multicall3
+  // holds no tokens (verified on Tenderly: GS013 from Safe wrapping the
+  // inner revert). Picking `safe` for the emit-calldata path keeps the
+  // default safe-for-Safes.
+  const outputMode: OutputMode = opts.outputMode ?? (emitSafeImport ? "safe" : "multicall")
+  if (outputMode === "multicall" && emitSafeImport) {
+    console.log(
+      `▸ ⚠ outputMode=multicall + --emit-calldata: the .safe.json will contain an ` +
+        `approve + Multicall3.aggregate3(transferFrom) batch. This is NOT executable ` +
+        `from a Safe — Safes need outputMode=safe (the default for --emit-calldata).`,
+    )
+  }
+  console.log(`▸ Output mode: ${outputMode}`)
+
   if (willSend && !privateKey) {
     throw new Error("settle(): privateKey is required when sending live transactions")
   }
@@ -325,6 +371,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       tokenSymbol: token.symbol,
       dryRun,
       emitSafeImport,
+      outputMode,
       delegatorCount: 0,
       manualOverride,
     })
@@ -574,6 +621,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       tokenSymbol: token.symbol,
       dryRun,
       emitSafeImport,
+      outputMode,
       delegatorCount: uniqueDelegatorCount,
       manualOverride,
     })
@@ -624,16 +672,41 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       tokenSymbol: token.symbol,
       dryRun,
       emitSafeImport,
+      outputMode,
       delegatorCount: uniqueDelegatorCount,
       manualOverride,
     })
   }
 
   // ---- 5. Calldata ----
+  // For `multicall` mode we want the *current* allowance (not the snapshot
+  // from `toBlock`) to decide whether to emit the approve tx: the operator
+  // may have approved Multicall3 between toBlock and now. Cheap re-read.
+  // Skip when in `safe` mode — allowance is unused there.
+  const currentAllowance: bigint =
+    outputMode === "multicall"
+      ? ((await publicClient.readContract({
+          address: config.tokenAddress,
+          abi: ERC20_ALLOWANCE_ABI,
+          functionName: "allowance",
+          args: [config.distributionWalletAddress, config.multicallAddress],
+        })) as bigint)
+      : 0n
+  if (outputMode === "multicall") {
+    console.log(
+      `▸ Allowance(${config.distributionWalletAddress} → Multicall3) @head: ${currentAllowance}` +
+        (currentAllowance >= totalForwarded
+          ? `  (≥ totalForwarded ${totalForwarded} — approve tx will be skipped)`
+          : `  (< totalForwarded ${totalForwarded} — approve tx will be included)`),
+    )
+  }
   const plannedTxs = buildPlannedTxs({
     multicall3: config.multicallAddress,
     token: config.tokenAddress,
     entries,
+    outputMode,
+    distributionWallet: config.distributionWalletAddress,
+    currentAllowance,
   })
 
   // ---- 6. Render plan ----
@@ -692,7 +765,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   // ---- 8. Branch on output mode ----
   const runId = newRunId()
   const startedAt = new Date().toISOString()
-  const txHashes: AuditRecord["txHashes"] = {}
+  const txHashes: AuditRecord["txHashes"] = []
   const serializedTxs = serializePlannedTxs(plannedTxs)
   let safeImportPathOut: string | undefined
 
@@ -793,6 +866,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       : {}),
     commissionBps,
     attributionMode,
+    outputMode,
     delegatorCount: uniqueDelegatorCount,
     transfers: summariseTransfersForAudit(entries),
     ...(attributedCheckpoints ? { attributedCheckpoints } : {}),
@@ -829,7 +903,7 @@ async function executeLive(input: ExecuteLiveInput): Promise<void> {
     const receipt = await publicClient.waitForTransactionReceipt({ hash })
     if (receipt.status !== "success") throw new Error(`${ptx.label} reverted (tx ${hash})`)
     console.log(`  ✓ mined: ${hash}`)
-    if (ptx.function === "aggregate3") txHashes.multicall3 = hash
+    txHashes.push({ label: ptx.label, function: ptx.function, hash })
   }
 }
 
@@ -849,6 +923,7 @@ interface NoopAuditInput {
   tokenSymbol: string
   dryRun: boolean
   emitSafeImport: boolean
+  outputMode: OutputMode
   delegatorCount: number
   manualOverride: boolean
 }
@@ -894,9 +969,10 @@ function writeNoopAudit(input: NoopAuditInput): SettleResult {
       : {}),
     commissionBps: input.commissionBps,
     attributionMode: input.config.attributionMode,
+    outputMode: input.outputMode,
     delegatorCount: input.delegatorCount,
     transfers: [],
-    txHashes: {},
+    txHashes: [],
     totals: { totalForwarded: "0", operatorRetention: input.rewardEarned.toString() },
     ...(input.manualOverride ? { manualOverride: true } : {}),
   }

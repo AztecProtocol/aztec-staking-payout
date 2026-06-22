@@ -85,14 +85,22 @@ export interface AuditRecord {
    *  Omitted in equal-split mode (no per-checkpoint attribution). */
   attributedCheckpoints?: AuditedCheckpoint[]
 
-  /** The encoded on-chain transactions this settlement produces (always one
-   *  Multicall3 `aggregate3` wrapping N `ERC20.transfer` inner calls).
+  /** Shape of the planned transactions: `safe` = N top-level `ERC20.transfer`
+   *  calls (one per delegator, the Safe wraps them in MultiSend); `multicall`
+   *  = optional `ERC20.approve(Multicall3, total)` followed by
+   *  `Multicall3.aggregate3([transferFrom, ...])` (for plain EOAs). */
+  outputMode: "safe" | "multicall"
+
+  /** The encoded on-chain transactions this settlement produces.
    *  Self-contained — an auditor / cold-wallet signer can replay these
    *  without needing the separate Safe-import file. Omitted only when there
    *  was nothing to send (zero delegators, no rewards, or sub-dust amounts). */
   transactions?: SerializedPlannedTx[]
 
-  txHashes: { multicall3?: Hex }
+  /** Tx hashes from the live broadcast, one entry per planned transaction
+   *  (positionally aligned with `transactions[]`). Empty in dry-run /
+   *  calldata-emit modes. */
+  txHashes: Array<{ label: string; function: string; hash: Hex }>
   totals: { totalForwarded: string; operatorRetention: string }
 
   error?: string
