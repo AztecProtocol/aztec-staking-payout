@@ -4,6 +4,7 @@ import { makePublicClient } from "./client.js"
 import { settle } from "./settle.js"
 import { discoverActiveDelegators, findDeployBlock, probeProviderIds } from "./discovery.js"
 import { createInlineProgress } from "./progress.js"
+import type { OutputMode } from "./types.js"
 
 interface ParsedArgs {
   command: "settle" | "status" | "help"
@@ -20,6 +21,14 @@ interface ParsedArgs {
   toEpoch: bigint | null
   /** Manual override of the reward amount (testing / what-if). Forces dry-run. */
   simulateReward: bigint | null
+  /** Output shape for the planned txs. `null` = auto (safe for --emit-calldata,
+   *  multicall for live broadcast). */
+  outputMode: OutputMode | null
+  /** Count every operator checkpoint regardless of `header.coinbase`. Default
+   *  is to count only checkpoints whose coinbase equals the configured
+   *  distribution wallet — the integrity gate against mid-window coinbase
+   *  switches. Opt in for testnet runs / what-if simulation. */
+  ignoreCoinbase: boolean
 }
 
 const ERC20_BALANCE_OF_ABI = [
@@ -40,9 +49,10 @@ Usage:
   aztec-staking-payout <command> [options]
 
 Commands:
-  settle             Compute the period's per-delegator transfers and submit
-                     a single Multicall3 batch of ERC20.transfer calls from
-                     the operator's distribution wallet.
+  settle             Compute the period's per-delegator transfers and either
+                     broadcast them (live) or emit Safe Transaction Builder
+                     calldata for a multisig / smart-account / cold-wallet
+                     signer. See --output-mode for transaction shaping.
   status             Print the distribution wallet's current token balance,
                      the configured commission, and the discovered active
                      delegators.
@@ -76,6 +86,35 @@ Options:
                               No PRIVATE_KEY required. Full per-recipient
                               breakdown + encoded calldata live in the audit
                               JSON — no separate summary file is written.
+  --output-mode <mode>        (settle) Shape of the planned transactions:
+                                safe       N top-level ERC20.transfer calls
+                                           (one per delegator). The Safe wraps
+                                           them in MultiSend; works for Safes,
+                                           smart-account wallets, and cold-
+                                           wallet EOAs signing one by one.
+                                multicall  Optional ERC20.approve(Multicall3,
+                                           total) + Multicall3.aggregate3 of
+                                           N transferFrom calls. Fewer txs,
+                                           but requires a plain EOA — Safes
+                                           CANNOT use this (the inner transfer
+                                           reverts with insufficient balance
+                                           on Multicall3).
+                              Defaults: 'safe' with --emit-calldata,
+                              'multicall' for live broadcast. Pin explicitly
+                              for a cold-wallet EOA that wants the batched
+                              shape via --emit-calldata.
+  --ignore-coinbase           (settle) Count every checkpoint proposed by the
+                              operator's attesters in the window regardless of
+                              the per-checkpoint header.coinbase. By default
+                              the tool only counts checkpoints whose coinbase
+                              matches the configured distributionWalletAddress
+                              — the integrity gate against mid-window coinbase
+                              switches (a counted checkpoint whose reward
+                              routed elsewhere isn't payable from the
+                              distribution wallet). Use this for testnet runs,
+                              what-if simulation, or when you've manually
+                              pre-funded the distribution wallet to cover a
+                              prior-coinbase period.
   --simulate-reward <amount>  (settle) Manual override of the reward amount.
                               By default the tool computes the reward via the
                               protocol formula (oursProposed × checkpointReward
@@ -111,6 +150,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     fromEpoch: null,
     toEpoch: null,
     simulateReward: null,
+    outputMode: null,
+    ignoreCoinbase: false,
   }
 
   if (args.length === 0) return out
@@ -144,6 +185,15 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
     else if (arg === "--simulate-reward")
       out.simulateReward = parseAmount(required(args[i++], "--simulate-reward"))
+    else if (arg === "--output-mode") {
+      const v = required(args[i++], "--output-mode")
+      if (v !== "safe" && v !== "multicall") {
+        process.stderr.write(`--output-mode must be 'safe' or 'multicall', got: ${v}\n`)
+        process.exit(1)
+      }
+      out.outputMode = v
+    }
+    else if (arg === "--ignore-coinbase") out.ignoreCoinbase = true
     else if (arg === "--from-epoch")
       out.fromEpoch = parseEpoch(required(args[i++], "--from-epoch"))
     else if (arg === "--to-epoch") {
@@ -227,6 +277,8 @@ async function runSettle(parsed: ParsedArgs): Promise<number> {
       emitSafeImport: parsed.emitSafeImport,
       safeImportPath: parsed.safeImportPath,
       simulateReward: parsed.simulateReward,
+      outputMode: parsed.outputMode,
+      ignoreCoinbase: parsed.ignoreCoinbase,
     })
     return 0
   } catch (err) {

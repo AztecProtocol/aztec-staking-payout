@@ -7,7 +7,12 @@ A small command-line tool Aztec sequencer operators run **once a week** to pay t
 
 **The problem it solves.** Provider commission rates in the Aztec staking protocol are baked into each delegation's coinbase split contract and **cannot be changed**. If your operating costs rise, you have no way to adjust the effective commission on delegations that already exist.
 
-**The workaround.** Configure your sequencers to set the L2 `coinbase` to a wallet *you* control — a Safe (Gnosis) is a good fit if you want multisig control of the payout, but the tool works with any wallet: an EOA you sign from directly, a smart-account, a cold-wallet workflow, whatever. All your provider's rewards flow there. Each week, run this tool — it figures out which of your attesters earned what, computes per-delegator amounts at your chosen commission, and gives you ready-to-sign ERC20 transfer calldata that pays everyone from the distribution wallet.
+**The workaround.** Configure your sequencers to set the L2 `coinbase` to a wallet *you* control — a Safe (Gnosis) is a good fit if you want multisig control of the payout, but the tool works with any wallet: an EOA you sign from directly, a smart-account, a cold-wallet workflow, whatever. All your provider's rewards flow there. Each week, run this tool — it figures out which of your attesters earned what, computes per-delegator amounts at your chosen commission, and gives you ready-to-sign calldata that pays everyone.
+
+**Two transaction shapes are available** (`--output-mode`):
+
+- `safe` (default for `--emit-calldata`): N top-level `ERC20.transfer` calls, one per delegator. The Safe wraps them in MultiSend at submission, so `msg.sender == Safe` on every inner transfer. Works for Safes, smart-account wallets, and cold-wallet EOAs signing one by one. **Required for Safes.**
+- `multicall` (default for live broadcast): an optional `ERC20.approve(Multicall3, total)` plus a single `Multicall3.aggregate3([ERC20.transferFrom(wallet, delegator, amount), ...])`. Fewer txs, atomic on the aggregate3 step. **Plain EOAs only** — Safes can't use this (Multicall3 becomes `msg.sender` on inner transfers and reverts with insufficient balance).
 
 The tool **doesn't hold any funds, doesn't deploy any contracts, and doesn't send anything by default** — it produces calldata that you (or your Safe) execute.
 
@@ -66,9 +71,10 @@ The tool runs through these phases (all read-only):
 2. Reads the rollup's `getRewardConfig()` at the toBlock for the per-checkpoint sequencer reward (`checkpointReward × sequencerBps / 10000`).
 3. Discovers your active delegators from on-chain (`StakedWithProvider` events filtered by your provider id, then `IGSE.isRegistered` to drop exits).
 4. Scans `CheckpointProposed` events in the window and recovers each checkpoint's proposer attester from its `propose()` transaction's signature. **Hard-fails** if any checkpoint can't be resolved — a plan is only ever produced from 100% resolved data.
-5. Computes the period's reward from the protocol formula: `oursProposed × per-checkpoint sequencer reward`. Deterministic and reproducible — doesn't depend on whether the operator has claimed their rewards from the rollup yet.
-6. Splits the reward in proportion to each delegator's attesters' proposal count (≥1 attester per recipient), applies your commission rate, and aggregates so each unique recipient gets one transfer.
-7. Emits direct ERC20 `transfer` calldata. Each transfer is executed by the distribution wallet itself, so Safe / smart-account execution spends the distribution wallet's token balance directly.
+5. **Filters by coinbase.** Of the checkpoints proposed by the operator's attesters, only those whose `header.coinbase == distributionWalletAddress` are counted toward the reward. Mismatched coinbases are recorded in the audit trail but dropped from the count — their rewards routed elsewhere and aren't payable from the distribution wallet. This is the integrity gate against mid-window coinbase switches; pass `--ignore-coinbase` to disable it for testnet / what-if runs.
+6. Computes the period's reward from the protocol formula: `countedCheckpoints × per-checkpoint sequencer reward`. Deterministic and reproducible — doesn't depend on whether the operator has claimed their rewards from the rollup yet.
+7. Splits the reward in proportion to each delegator's attesters' proposal count (≥1 attester per recipient), applies your commission rate, and aggregates so each unique recipient gets one transfer.
+8. Emits the planned transactions in the chosen `--output-mode` shape (`safe` or `multicall`; see the modes summary above).
 
 > **Before executing the calldata**, the operator needs to claim accrued sequencer rewards from the rollup so the distribution wallet holds enough to fund the transfers: `rollup.claimSequencerRewards(distributionWallet)`. Live mode pre-flights the wallet's balance and errors clearly if it's short. Safe mode (`--emit-calldata`) trusts the operator to fund the wallet before importing the bundle.
 
@@ -90,15 +96,22 @@ NEXT STEPS
 
   · Safe / Gnosis multisig → app.safe.global → Apps → Transaction Builder
         import ./runs/epoch-3025-3166-<runId>.safe.json
+    (must use --output-mode safe — the default for --emit-calldata)
 
   · Other smart-account / multisig signers usually accept the same
     Safe Transaction Builder JSON — check your tool's import options.
 
   · Cold-wallet / scripted signer → read the encoded {to, value, data}
     from the audit JSON's `transactions` array and broadcast directly.
+    Default shape is N separate transfers (safe mode); pass
+    --output-mode multicall to get an approve + Multicall3.aggregate3
+    pair instead.
 
   · EOA you control → re-run with PRIVATE_KEY set and without
-    --emit-calldata to sign and broadcast in one step.
+    --emit-calldata to sign and broadcast in one step. Defaults to
+    --output-mode multicall (2 txs: approve + aggregate3 of N
+    transferFroms). Pass --output-mode safe to send N individual
+    transfers instead.
 ```
 
 ### Step 3 — keep the audit record
@@ -149,7 +162,8 @@ The tool **refuses to produce a plan from incomplete data**. Specifically:
 
 - **Epoch-aligned windows.** Settlement is in epochs, not blocks. An epoch lands as a single proof on L1 — when the proof is submitted, *all* rewards for that epoch are credited at once. Aligning on epochs means no proof can be split between two runs.
 - **Finalization gate.** A run **only ever considers epochs that are (a) proven on the rollup AND (b) in an L1-finalized block**. The resolver caps `--to-epoch` at the latest proven epoch and refuses any window whose proof block isn't yet L1-finalized. There's no opt-out — reorg safety is the default.
-- **Protocol-derived reward.** The amount to distribute is computed from the rollup's `getRewardConfig` and the checkpoint count: `oursProposed × (checkpointReward × sequencerBps / 10000)`. The wallet's balance isn't consulted — so the result doesn't depend on whether the operator has claimed their rewards from the rollup yet, doesn't drift if random transfers hit the wallet, and is reproducible from on-chain data alone. (Known limitation: per-checkpoint variable transaction fees aren't included; the fixed `sequencerCheckpointReward` dominates.)
+- **Protocol-derived reward.** The amount to distribute is computed from the rollup's `getRewardConfig` and the counted-checkpoint count: `countedCheckpoints × (checkpointReward × sequencerBps / 10000)`. The wallet's balance isn't consulted — so the result doesn't depend on whether the operator has claimed their rewards from the rollup yet, doesn't drift if random transfers hit the wallet, and is reproducible from on-chain data alone. (Known limitation: per-checkpoint variable transaction fees aren't included; the fixed `sequencerCheckpointReward` dominates.)
+- **Coinbase integrity gate.** Of the checkpoints proposed by the operator's attesters, only those whose `header.coinbase == distributionWalletAddress` contribute to `countedCheckpoints`. Checkpoints routed elsewhere (a mid-window coinbase switch, a misconfigured sequencer, a builder/escrow address) are recorded in the audit trail with `counted: false` and dropped from the reward. This keeps the tool from promising delegators more than actually landed in the wallet. `--ignore-coinbase` disables the filter for testnet runs and pre-funded what-if scenarios.
 - **Retry + rate limiting.** Every RPC call is retried with exponential backoff. A token-bucket rate limiter (`rpcMaxRequestsPerSecond` in config, default 100) keeps the call rate under your provider's cap so requests aren't silently dropped.
 - **All-or-nothing proposer recovery.** If any single checkpoint can't be resolved to a proposer after retries, the run **stops with an error** — it won't hand you a skewed split. Re-run (or fix the RPC, lower the rate limit, etc.) and it'll be deterministic.
 - **Deterministic by epoch.** For a fixed `[from-epoch, to-epoch]` window the result is **exact and reproducible** — two runs produce byte-identical plans. (`--to-epoch latest-proven` advances as epochs prove; pin a number for comparison.)
@@ -184,6 +198,22 @@ Options:
                               the audit JSON. The encoded transactions also
                               land in the audit JSON, so cold-wallet signers
                               can read them straight from there.
+  --output-mode <mode>        (settle) `safe` = N top-level ERC20.transfer
+                              calls (one per delegator); the Safe bundles them
+                              via MultiSend. `multicall` = optional
+                              ERC20.approve(Multicall3, total) +
+                              Multicall3.aggregate3 of N transferFrom calls;
+                              EOAs only — Safes cannot use this. Defaults:
+                              `safe` with --emit-calldata, `multicall` for
+                              live broadcast.
+  --ignore-coinbase           (settle) Count every operator checkpoint in the
+                              window regardless of `header.coinbase`. Default
+                              counts only checkpoints whose coinbase matches
+                              `distributionWalletAddress` — the integrity gate
+                              against mid-window switches. Use for testnet /
+                              what-if runs or when you've manually pre-funded
+                              the distribution wallet to cover a prior-coinbase
+                              period.
   --simulate-reward <amount>  (settle) Manual override of the reward amount.
                               The default is to compute the reward from the
                               protocol formula (checkpoint count × per-
@@ -213,7 +243,7 @@ Environment:
 │   ├── proposals.ts     count checkpoints each attester proposed
 │   ├── attribution.ts   proposal-weighted (or equal) split + commission
 │   ├── epochs.ts        epoch-range → L1 block range resolver
-│   ├── calldata.ts      ERC20.transfer calldata + Safe export
+│   ├── calldata.ts      planned-tx builder (safe / multicall modes) + Safe export
 │   ├── settle.ts        orchestrator (the `settle` command)
 │   ├── audit.ts         per-run audit record writer + plan pretty-printer
 │   ├── client.ts        rate-limited viem PublicClient + RPC counter

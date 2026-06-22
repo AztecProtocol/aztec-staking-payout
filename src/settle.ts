@@ -17,7 +17,7 @@ import { countProposalsByProposer } from "./proposals.js"
 import { computeGasSpent } from "./gascost.js"
 import { resolveEpochRange, type EpochRange } from "./epochs.js"
 import { createInlineProgress } from "./progress.js"
-import type { AttributionMode } from "./types.js"
+import type { AttributionMode, OutputMode } from "./types.js"
 import {
   formatPlanForHumans,
   newRunId,
@@ -33,6 +33,19 @@ const ERC20_BALANCE_OF_ABI = [
     type: "function",
     stateMutability: "view",
     inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const
+
+const ERC20_ALLOWANCE_ABI = [
+  {
+    name: "allowance",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
     outputs: [{ name: "", type: "uint256" }],
   },
 ] as const
@@ -105,6 +118,22 @@ export interface SettleOptions {
    *  Useful for what-if sizing and as the *only* way to drive equal-split
    *  mode, which has no proposal count to multiply by. */
   simulateReward: bigint | null
+  /** Output shape for the planned transactions. `null` means "auto":
+   *  `safe` for `--emit-calldata` (Safes can't use Multicall3 for ERC20
+   *  transfers — `msg.sender` inside aggregate3 is Multicall3, which holds
+   *  no tokens, so the inner transfer reverts), `multicall` for live
+   *  broadcast (a plain EOA gets fewer txs by approving once and aggregating
+   *  transferFrom calls). Cold-wallet EOAs reading the audit JSON can pick
+   *  either by passing this flag explicitly. */
+  outputMode: OutputMode | null
+  /** When true, count every checkpoint proposed by the operator's attesters
+   *  regardless of `header.coinbase`. Default (false) only counts checkpoints
+   *  whose `coinbase == distributionWalletAddress` — the integrity gate
+   *  that keeps the tool from promising more than actually landed in the
+   *  wallet. Set this for testnet runs, what-if simulation, or when the
+   *  operator manually pre-funded the distribution wallet to cover a
+   *  prior-coinbase period. */
+  ignoreCoinbase: boolean
 }
 
 export interface SettleResult {
@@ -125,12 +154,19 @@ export interface SettleResult {
  *   3. Discover active delegators from on-chain (or use config override).
  *   4. Count checkpoints each attester proposed within the epoch range.
  *   5. Proposal-weighted split + commission; or equal-split (override path).
- *   6. Build a single Multicall3 batch of ERC20.transfer calls.
+ *   6. Build planned txs in the chosen output mode:
+ *        - "safe":      N top-level `ERC20.transfer` calls (one per
+ *          delegator). Safe wraps them in MultiSend; works for Safes,
+ *          smart-account wallets, and cold-wallet EOAs signing one by one.
+ *        - "multicall": optional `ERC20.approve(Multicall3, total)` + one
+ *          `Multicall3.aggregate3([transferFrom, ...])`. Fewer txs but
+ *          requires the wallet to be a plain EOA (Safes can't use this —
+ *          inner transfer reverts with insufficient balance on Multicall3).
  *   7. Branch on output mode (dry-run / emit-calldata / live).
  *   8. Write audit record.
  */
 export async function settle(opts: SettleOptions): Promise<SettleResult> {
-  const { config, privateKey, fromEpoch, toEpoch, simulateReward } = opts
+  const { config, privateKey, fromEpoch, toEpoch, simulateReward, ignoreCoinbase } = opts
   // Mode determination is moved down to after the prelude (we need to read
   // the reward config first so we can announce the derived reward before
   // entering the manual-override branch). `willSend` etc. are set there.
@@ -249,6 +285,24 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   const safeImportPathOverride = manualOverride ? null : opts.safeImportPath
   const willSend = !dryRun && !emitSafeImport
 
+  // Output-mode selection. Explicit > auto. Auto: `safe` whenever the user
+  // asked for an importable bundle (`--emit-calldata`); `multicall` for live
+  // broadcast (an EOA gets to settle a whole period in two txs). Safes
+  // *cannot* use `multicall` — Multicall3 becomes `msg.sender` on each inner
+  // ERC20.transfer and reverts with insufficient balance because Multicall3
+  // holds no tokens (verified on Tenderly: GS013 from Safe wrapping the
+  // inner revert). Picking `safe` for the emit-calldata path keeps the
+  // default safe-for-Safes.
+  const outputMode: OutputMode = opts.outputMode ?? (emitSafeImport ? "safe" : "multicall")
+  if (outputMode === "multicall" && emitSafeImport) {
+    console.log(
+      `▸ ⚠ outputMode=multicall + --emit-calldata: the .safe.json will contain an ` +
+        `approve + Multicall3.aggregate3(transferFrom) batch. This is NOT executable ` +
+        `from a Safe — Safes need outputMode=safe (the default for --emit-calldata).`,
+    )
+  }
+  console.log(`▸ Output mode: ${outputMode}`)
+
   if (willSend && !privateKey) {
     throw new Error("settle(): privateKey is required when sending live transactions")
   }
@@ -325,6 +379,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       tokenSymbol: token.symbol,
       dryRun,
       emitSafeImport,
+      outputMode,
       delegatorCount: 0,
       manualOverride,
     })
@@ -399,18 +454,24 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       progress.done()
     }
 
-    // Walk the attributed-checkpoint trail once and keep every checkpoint
-    // proposed by one of our attesters. The protocol formula counts what the
-    // operator's attesters *earned* — rewards always accrue to whatever
-    // `header.coinbase` was set per checkpoint. The operator is then
-    // responsible for funding `distributionWalletAddress` (either by setting
-    // `coinbase = distributionWalletAddress` directly, or by claiming from a
-    // separate coinbase and transferring in).
+    // Walk the attributed-checkpoint trail once. A checkpoint is counted
+    // toward the reward only when (a) its proposer is one of the operator's
+    // attesters AND (b) `header.coinbase == distributionWalletAddress`. The
+    // second clause is the integrity gate: only rewards that *actually
+    // landed* in the distribution wallet should be paid out to delegators.
+    // Without it, a mid-window coinbase switch would have the tool promise
+    // delegators more than the wallet can fund.
     //
-    // We still surface a warning when `header.coinbase != distributionWallet`
-    // — that's a common-enough operational diagnostic (sequencer misconfig,
-    // routing to the wrong wallet) that operators want to see it, even if
-    // it doesn't change the reward calculation.
+    // Operators who genuinely want to count all of their attesters'
+    // checkpoints regardless of where the reward routed can pass
+    // `--ignore-coinbase` (testnet runs, what-if simulation, or a case
+    // where the operator manually funded the distribution wallet to cover
+    // a prior-coinbase period).
+    //
+    // Either way, every checkpoint by one of our attesters is recorded in
+    // `attributedCheckpoints` with a `counted` flag, so the audit JSON
+    // shows the full trail and the auditor can see exactly which entries
+    // were dropped and why.
     const ourAttesters = new Map<string, { attester: Address; delegator: Address }>()
     for (const d of discovered) {
       ourAttesters.set(d.attester.toLowerCase(), { attester: d.attester, delegator: d.delegator })
@@ -418,12 +479,19 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     const distWallet = config.distributionWalletAddress.toLowerCase()
     const ourPerAttester = new Map<string, number>()
     const offDistWalletPerAttester = new Map<string, { count: number; coinbases: Set<string> }>()
+    let droppedDueToCoinbase = 0
     attributedCheckpoints = []
     for (const c of counts.attributed) {
       const attesterKey = c.proposer.toLowerCase()
       const ours = ourAttesters.get(attesterKey)
       if (!ours) continue
-      ourPerAttester.set(attesterKey, (ourPerAttester.get(attesterKey) ?? 0) + 1)
+      const coinbaseMatches = c.coinbase.toLowerCase() === distWallet
+      const counted = ignoreCoinbase || coinbaseMatches
+      if (counted) {
+        ourPerAttester.set(attesterKey, (ourPerAttester.get(attesterKey) ?? 0) + 1)
+      } else {
+        droppedDueToCoinbase++
+      }
       attributedCheckpoints.push({
         checkpointNumber: c.checkpointNumber.toString(),
         txHash: c.txHash,
@@ -431,8 +499,9 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         attester: ours.attester,
         delegator: ours.delegator,
         coinbase: c.coinbase,
+        counted,
       })
-      if (c.coinbase.toLowerCase() !== distWallet) {
+      if (!coinbaseMatches) {
         const m =
           offDistWalletPerAttester.get(attesterKey) ?? { count: 0, coinbases: new Set<string>() }
         m.count++
@@ -453,9 +522,15 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       extras.push(`${counts.outOfRangeCheckpoints} dropped (outside epoch range)`)
     if (counts.prunedAndReusedCheckpoints > 0)
       extras.push(`${counts.prunedAndReusedCheckpoints} pruned-and-reused (older event superseded)`)
+    const oursTotal = attributedCheckpoints.length
+    const coinbaseSuffix = ignoreCoinbase
+      ? ` (counting all — --ignore-coinbase set)`
+      : droppedDueToCoinbase > 0
+        ? ` (${droppedDueToCoinbase} of ${oursTotal} dropped: coinbase ≠ distributionWalletAddress)`
+        : ``
     console.log(
-      `▸ Checkpoints: ${counts.totalCheckpoints} in epoch range → ${oursProposed} by our attester(s)` +
-        (extras.length > 0 ? `  (${extras.join("; ")})` : ``),
+      `▸ Checkpoints: ${counts.totalCheckpoints} in epoch range → ${oursProposed} counted toward ` +
+        `reward${coinbaseSuffix}` + (extras.length > 0 ? `  (${extras.join("; ")})` : ``),
     )
     for (const d of discovered) {
       const n = ourPerAttester.get(d.attester.toLowerCase()) ?? 0
@@ -464,16 +539,24 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     if (offDistWalletPerAttester.size > 0) {
       let total = 0
       for (const { count } of offDistWalletPerAttester.values()) total += count
+      const verb = ignoreCoinbase
+        ? `INCLUDED in the count (--ignore-coinbase is set)`
+        : `DROPPED from the count — rewards from those proposals accrued elsewhere`
       console.log(
-        `▸ ⓘ ${total} of those checkpoint(s) set header.coinbase to a wallet other than ` +
-          `${config.distributionWalletAddress}. Rewards from those proposals accrued to that ` +
-          `other wallet — fine if you fund the distribution wallet from there separately, ` +
-          `worth investigating if you expected coinbase == distributionWalletAddress:`,
+        `▸ ⚠ ${total} of the operator's checkpoint(s) had header.coinbase ≠ ` +
+          `${config.distributionWalletAddress}. ${verb}:`,
       )
       for (const [attesterKey, { count, coinbases }] of offDistWalletPerAttester) {
         const ours = ourAttesters.get(attesterKey)!
         const cbList = [...coinbases].join(", ")
         console.log(`    · attester ${ours.attester}: ${count} checkpoint(s) → coinbase ${cbList}`)
+      }
+      if (!ignoreCoinbase) {
+        console.log(
+          `    To count these anyway (e.g. you switched coinbase mid-window and have ` +
+            `pre-funded the distribution wallet to cover the prior period), re-run with ` +
+            `--ignore-coinbase.`,
+        )
       }
     }
 
@@ -574,6 +657,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       tokenSymbol: token.symbol,
       dryRun,
       emitSafeImport,
+      outputMode,
       delegatorCount: uniqueDelegatorCount,
       manualOverride,
     })
@@ -624,15 +708,41 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       tokenSymbol: token.symbol,
       dryRun,
       emitSafeImport,
+      outputMode,
       delegatorCount: uniqueDelegatorCount,
       manualOverride,
     })
   }
 
   // ---- 5. Calldata ----
+  // For `multicall` mode we want the *current* allowance (not the snapshot
+  // from `toBlock`) to decide whether to emit the approve tx: the operator
+  // may have approved Multicall3 between toBlock and now. Cheap re-read.
+  // Skip when in `safe` mode — allowance is unused there.
+  const currentAllowance: bigint =
+    outputMode === "multicall"
+      ? ((await publicClient.readContract({
+          address: config.tokenAddress,
+          abi: ERC20_ALLOWANCE_ABI,
+          functionName: "allowance",
+          args: [config.distributionWalletAddress, config.multicallAddress],
+        })) as bigint)
+      : 0n
+  if (outputMode === "multicall") {
+    console.log(
+      `▸ Allowance(${config.distributionWalletAddress} → Multicall3) @head: ${currentAllowance}` +
+        (currentAllowance >= totalForwarded
+          ? `  (≥ totalForwarded ${totalForwarded} — approve tx will be skipped)`
+          : `  (< totalForwarded ${totalForwarded} — approve tx will be included)`),
+    )
+  }
   const plannedTxs = buildPlannedTxs({
+    multicall3: config.multicallAddress,
     token: config.tokenAddress,
     entries,
+    outputMode,
+    distributionWallet: config.distributionWalletAddress,
+    currentAllowance,
   })
 
   // ---- 6. Render plan ----
@@ -691,7 +801,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   // ---- 8. Branch on output mode ----
   const runId = newRunId()
   const startedAt = new Date().toISOString()
-  const txHashes: AuditRecord["txHashes"] = {}
+  const txHashes: AuditRecord["txHashes"] = []
   const serializedTxs = serializePlannedTxs(plannedTxs)
   let safeImportPathOut: string | undefined
 
@@ -792,9 +902,21 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       : {}),
     commissionBps,
     attributionMode,
+    outputMode,
     delegatorCount: uniqueDelegatorCount,
     transfers: summariseTransfersForAudit(entries),
-    ...(attributedCheckpoints ? { attributedCheckpoints } : {}),
+    ...(attributedCheckpoints
+      ? {
+          attributedCheckpoints,
+          coinbaseFilter: {
+            mode: ignoreCoinbase ? ("ignored" as const) : ("match-distribution-wallet" as const),
+            expectedCoinbase: config.distributionWalletAddress,
+            operatorTotal: attributedCheckpoints.length,
+            counted: oursProposed,
+            droppedDueToCoinbaseMismatch: ignoreCoinbase ? 0 : attributedCheckpoints.length - oursProposed,
+          },
+        }
+      : {}),
     txHashes,
     ...(manualOverride ? { manualOverride: true } : {}),
     ...(safeImportPathOut ? { safeImportPath: safeImportPathOut } : {}),
@@ -828,10 +950,7 @@ async function executeLive(input: ExecuteLiveInput): Promise<void> {
     const receipt = await publicClient.waitForTransactionReceipt({ hash })
     if (receipt.status !== "success") throw new Error(`${ptx.label} reverted (tx ${hash})`)
     console.log(`  ✓ mined: ${hash}`)
-    if (ptx.function === "transfer") {
-      txHashes.transfers ??= []
-      txHashes.transfers.push(hash)
-    }
+    txHashes.push({ label: ptx.label, function: ptx.function, hash })
   }
 }
 
@@ -851,6 +970,7 @@ interface NoopAuditInput {
   tokenSymbol: string
   dryRun: boolean
   emitSafeImport: boolean
+  outputMode: OutputMode
   delegatorCount: number
   manualOverride: boolean
 }
@@ -896,9 +1016,10 @@ function writeNoopAudit(input: NoopAuditInput): SettleResult {
       : {}),
     commissionBps: input.commissionBps,
     attributionMode: input.config.attributionMode,
+    outputMode: input.outputMode,
     delegatorCount: input.delegatorCount,
     transfers: [],
-    txHashes: {},
+    txHashes: [],
     totals: { totalForwarded: "0", operatorRetention: input.rewardEarned.toString() },
     ...(input.manualOverride ? { manualOverride: true } : {}),
   }
