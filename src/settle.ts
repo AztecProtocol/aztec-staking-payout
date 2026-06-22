@@ -126,6 +126,14 @@ export interface SettleOptions {
    *  transferFrom calls). Cold-wallet EOAs reading the audit JSON can pick
    *  either by passing this flag explicitly. */
   outputMode: OutputMode | null
+  /** When true, count every checkpoint proposed by the operator's attesters
+   *  regardless of `header.coinbase`. Default (false) only counts checkpoints
+   *  whose `coinbase == distributionWalletAddress` — the integrity gate
+   *  that keeps the tool from promising more than actually landed in the
+   *  wallet. Set this for testnet runs, what-if simulation, or when the
+   *  operator manually pre-funded the distribution wallet to cover a
+   *  prior-coinbase period. */
+  ignoreCoinbase: boolean
 }
 
 export interface SettleResult {
@@ -158,7 +166,7 @@ export interface SettleResult {
  *   8. Write audit record.
  */
 export async function settle(opts: SettleOptions): Promise<SettleResult> {
-  const { config, privateKey, fromEpoch, toEpoch, simulateReward } = opts
+  const { config, privateKey, fromEpoch, toEpoch, simulateReward, ignoreCoinbase } = opts
   // Mode determination is moved down to after the prelude (we need to read
   // the reward config first so we can announce the derived reward before
   // entering the manual-override branch). `willSend` etc. are set there.
@@ -446,18 +454,24 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       progress.done()
     }
 
-    // Walk the attributed-checkpoint trail once and keep every checkpoint
-    // proposed by one of our attesters. The protocol formula counts what the
-    // operator's attesters *earned* — rewards always accrue to whatever
-    // `header.coinbase` was set per checkpoint. The operator is then
-    // responsible for funding `distributionWalletAddress` (either by setting
-    // `coinbase = distributionWalletAddress` directly, or by claiming from a
-    // separate coinbase and transferring in).
+    // Walk the attributed-checkpoint trail once. A checkpoint is counted
+    // toward the reward only when (a) its proposer is one of the operator's
+    // attesters AND (b) `header.coinbase == distributionWalletAddress`. The
+    // second clause is the integrity gate: only rewards that *actually
+    // landed* in the distribution wallet should be paid out to delegators.
+    // Without it, a mid-window coinbase switch would have the tool promise
+    // delegators more than the wallet can fund.
     //
-    // We still surface a warning when `header.coinbase != distributionWallet`
-    // — that's a common-enough operational diagnostic (sequencer misconfig,
-    // routing to the wrong wallet) that operators want to see it, even if
-    // it doesn't change the reward calculation.
+    // Operators who genuinely want to count all of their attesters'
+    // checkpoints regardless of where the reward routed can pass
+    // `--ignore-coinbase` (testnet runs, what-if simulation, or a case
+    // where the operator manually funded the distribution wallet to cover
+    // a prior-coinbase period).
+    //
+    // Either way, every checkpoint by one of our attesters is recorded in
+    // `attributedCheckpoints` with a `counted` flag, so the audit JSON
+    // shows the full trail and the auditor can see exactly which entries
+    // were dropped and why.
     const ourAttesters = new Map<string, { attester: Address; delegator: Address }>()
     for (const d of discovered) {
       ourAttesters.set(d.attester.toLowerCase(), { attester: d.attester, delegator: d.delegator })
@@ -465,12 +479,19 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     const distWallet = config.distributionWalletAddress.toLowerCase()
     const ourPerAttester = new Map<string, number>()
     const offDistWalletPerAttester = new Map<string, { count: number; coinbases: Set<string> }>()
+    let droppedDueToCoinbase = 0
     attributedCheckpoints = []
     for (const c of counts.attributed) {
       const attesterKey = c.proposer.toLowerCase()
       const ours = ourAttesters.get(attesterKey)
       if (!ours) continue
-      ourPerAttester.set(attesterKey, (ourPerAttester.get(attesterKey) ?? 0) + 1)
+      const coinbaseMatches = c.coinbase.toLowerCase() === distWallet
+      const counted = ignoreCoinbase || coinbaseMatches
+      if (counted) {
+        ourPerAttester.set(attesterKey, (ourPerAttester.get(attesterKey) ?? 0) + 1)
+      } else {
+        droppedDueToCoinbase++
+      }
       attributedCheckpoints.push({
         checkpointNumber: c.checkpointNumber.toString(),
         txHash: c.txHash,
@@ -478,8 +499,9 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         attester: ours.attester,
         delegator: ours.delegator,
         coinbase: c.coinbase,
+        counted,
       })
-      if (c.coinbase.toLowerCase() !== distWallet) {
+      if (!coinbaseMatches) {
         const m =
           offDistWalletPerAttester.get(attesterKey) ?? { count: 0, coinbases: new Set<string>() }
         m.count++
@@ -500,9 +522,15 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       extras.push(`${counts.outOfRangeCheckpoints} dropped (outside epoch range)`)
     if (counts.prunedAndReusedCheckpoints > 0)
       extras.push(`${counts.prunedAndReusedCheckpoints} pruned-and-reused (older event superseded)`)
+    const oursTotal = attributedCheckpoints.length
+    const coinbaseSuffix = ignoreCoinbase
+      ? ` (counting all — --ignore-coinbase set)`
+      : droppedDueToCoinbase > 0
+        ? ` (${droppedDueToCoinbase} of ${oursTotal} dropped: coinbase ≠ distributionWalletAddress)`
+        : ``
     console.log(
-      `▸ Checkpoints: ${counts.totalCheckpoints} in epoch range → ${oursProposed} by our attester(s)` +
-        (extras.length > 0 ? `  (${extras.join("; ")})` : ``),
+      `▸ Checkpoints: ${counts.totalCheckpoints} in epoch range → ${oursProposed} counted toward ` +
+        `reward${coinbaseSuffix}` + (extras.length > 0 ? `  (${extras.join("; ")})` : ``),
     )
     for (const d of discovered) {
       const n = ourPerAttester.get(d.attester.toLowerCase()) ?? 0
@@ -511,16 +539,24 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     if (offDistWalletPerAttester.size > 0) {
       let total = 0
       for (const { count } of offDistWalletPerAttester.values()) total += count
+      const verb = ignoreCoinbase
+        ? `INCLUDED in the count (--ignore-coinbase is set)`
+        : `DROPPED from the count — rewards from those proposals accrued elsewhere`
       console.log(
-        `▸ ⓘ ${total} of those checkpoint(s) set header.coinbase to a wallet other than ` +
-          `${config.distributionWalletAddress}. Rewards from those proposals accrued to that ` +
-          `other wallet — fine if you fund the distribution wallet from there separately, ` +
-          `worth investigating if you expected coinbase == distributionWalletAddress:`,
+        `▸ ⚠ ${total} of the operator's checkpoint(s) had header.coinbase ≠ ` +
+          `${config.distributionWalletAddress}. ${verb}:`,
       )
       for (const [attesterKey, { count, coinbases }] of offDistWalletPerAttester) {
         const ours = ourAttesters.get(attesterKey)!
         const cbList = [...coinbases].join(", ")
         console.log(`    · attester ${ours.attester}: ${count} checkpoint(s) → coinbase ${cbList}`)
+      }
+      if (!ignoreCoinbase) {
+        console.log(
+          `    To count these anyway (e.g. you switched coinbase mid-window and have ` +
+            `pre-funded the distribution wallet to cover the prior period), re-run with ` +
+            `--ignore-coinbase.`,
+        )
       }
     }
 
@@ -869,7 +905,18 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     outputMode,
     delegatorCount: uniqueDelegatorCount,
     transfers: summariseTransfersForAudit(entries),
-    ...(attributedCheckpoints ? { attributedCheckpoints } : {}),
+    ...(attributedCheckpoints
+      ? {
+          attributedCheckpoints,
+          coinbaseFilter: {
+            mode: ignoreCoinbase ? ("ignored" as const) : ("match-distribution-wallet" as const),
+            expectedCoinbase: config.distributionWalletAddress,
+            operatorTotal: attributedCheckpoints.length,
+            counted: oursProposed,
+            droppedDueToCoinbaseMismatch: ignoreCoinbase ? 0 : attributedCheckpoints.length - oursProposed,
+          },
+        }
+      : {}),
     txHashes,
     ...(manualOverride ? { manualOverride: true } : {}),
     ...(safeImportPathOut ? { safeImportPath: safeImportPathOut } : {}),

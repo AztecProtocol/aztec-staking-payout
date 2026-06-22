@@ -78,12 +78,32 @@ export interface AuditRecord {
   delegatorCount: number
   transfers: AuditTransfer[]
 
-  /** In `proposals` attribution mode: the full list of checkpoints attributed
-   *  to this operator's attesters this period. Every entry corresponds to a
-   *  +1 in some attester's proposal count. Delegators / outside auditors can
-   *  spot-check the split by re-fetching each tx and recovering the proposer.
-   *  Omitted in equal-split mode (no per-checkpoint attribution). */
+  /** In `proposals` attribution mode: the full list of checkpoints proposed
+   *  by this operator's attesters this period. Each entry's `counted` flag
+   *  records whether it contributed to the reward (coinbase matched the
+   *  distribution wallet, OR `--ignore-coinbase` was set). Omitted in
+   *  equal-split mode. */
   attributedCheckpoints?: AuditedCheckpoint[]
+
+  /** Summary of the coinbase filter applied this run. Omitted in equal-split
+   *  mode (no per-checkpoint coinbase data). */
+  coinbaseFilter?: {
+    /** `match-distribution-wallet` = default; only `coinbase ==
+     *  distributionWalletAddress` checkpoints counted. `ignored` =
+     *  `--ignore-coinbase` was set; every operator checkpoint counted. */
+    mode: "match-distribution-wallet" | "ignored"
+    /** The address that was used for the match (always
+     *  `distributionWalletAddress` — recorded explicitly so a reader of
+     *  the audit doesn't have to cross-reference). */
+    expectedCoinbase: Address
+    /** Total checkpoints by the operator's attesters in the window. */
+    operatorTotal: number
+    /** How many of those were counted toward the reward. */
+    counted: number
+    /** How many were dropped due to coinbase mismatch (always 0 when
+     *  `mode == "ignored"`). */
+    droppedDueToCoinbaseMismatch: number
+  }
 
   /** Shape of the planned transactions: `safe` = N top-level `ERC20.transfer`
    *  calls (one per delegator, the Safe wraps them in MultiSend); `multicall`
@@ -148,6 +168,11 @@ export interface AuditedCheckpoint {
    *  header; also makes any divergence from `distributionWalletAddress`
    *  visible to whoever's reading the audit. */
   coinbase: Address
+  /** Whether this checkpoint contributed to the reward count. False when
+   *  `coinbase != distributionWalletAddress` and `--ignore-coinbase` wasn't
+   *  set — those rewards routed elsewhere and aren't payable from the
+   *  distribution wallet. */
+  counted: boolean
 }
 
 export function summariseTransfersForAudit(entries: DistributionEntry[]): AuditTransfer[] {

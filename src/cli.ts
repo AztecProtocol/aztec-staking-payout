@@ -24,6 +24,11 @@ interface ParsedArgs {
   /** Output shape for the planned txs. `null` = auto (safe for --emit-calldata,
    *  multicall for live broadcast). */
   outputMode: OutputMode | null
+  /** Count every operator checkpoint regardless of `header.coinbase`. Default
+   *  is to count only checkpoints whose coinbase equals the configured
+   *  distribution wallet — the integrity gate against mid-window coinbase
+   *  switches. Opt in for testnet runs / what-if simulation. */
+  ignoreCoinbase: boolean
 }
 
 const ERC20_BALANCE_OF_ABI = [
@@ -98,6 +103,18 @@ Options:
                               'multicall' for live broadcast. Pin explicitly
                               for a cold-wallet EOA that wants the batched
                               shape via --emit-calldata.
+  --ignore-coinbase           (settle) Count every checkpoint proposed by the
+                              operator's attesters in the window regardless of
+                              the per-checkpoint header.coinbase. By default
+                              the tool only counts checkpoints whose coinbase
+                              matches the configured distributionWalletAddress
+                              — the integrity gate against mid-window coinbase
+                              switches (a counted checkpoint whose reward
+                              routed elsewhere isn't payable from the
+                              distribution wallet). Use this for testnet runs,
+                              what-if simulation, or when you've manually
+                              pre-funded the distribution wallet to cover a
+                              prior-coinbase period.
   --simulate-reward <amount>  (settle) Manual override of the reward amount.
                               By default the tool computes the reward via the
                               protocol formula (oursProposed × checkpointReward
@@ -134,6 +151,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     toEpoch: null,
     simulateReward: null,
     outputMode: null,
+    ignoreCoinbase: false,
   }
 
   if (args.length === 0) return out
@@ -175,6 +193,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
       out.outputMode = v
     }
+    else if (arg === "--ignore-coinbase") out.ignoreCoinbase = true
     else if (arg === "--from-epoch")
       out.fromEpoch = parseEpoch(required(args[i++], "--from-epoch"))
     else if (arg === "--to-epoch") {
@@ -259,6 +278,7 @@ async function runSettle(parsed: ParsedArgs): Promise<number> {
       safeImportPath: parsed.safeImportPath,
       simulateReward: parsed.simulateReward,
       outputMode: parsed.outputMode,
+      ignoreCoinbase: parsed.ignoreCoinbase,
     })
     return 0
   } catch (err) {

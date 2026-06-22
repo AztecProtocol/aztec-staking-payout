@@ -71,9 +71,10 @@ The tool runs through these phases (all read-only):
 2. Reads the rollup's `getRewardConfig()` at the toBlock for the per-checkpoint sequencer reward (`checkpointReward × sequencerBps / 10000`).
 3. Discovers your active delegators from on-chain (`StakedWithProvider` events filtered by your provider id, then `IGSE.isRegistered` to drop exits).
 4. Scans `CheckpointProposed` events in the window and recovers each checkpoint's proposer attester from its `propose()` transaction's signature. **Hard-fails** if any checkpoint can't be resolved — a plan is only ever produced from 100% resolved data.
-5. Computes the period's reward from the protocol formula: `oursProposed × per-checkpoint sequencer reward`. Deterministic and reproducible — doesn't depend on whether the operator has claimed their rewards from the rollup yet.
-6. Splits the reward in proportion to each delegator's attesters' proposal count (≥1 attester per recipient), applies your commission rate, and aggregates so each unique recipient gets one transfer.
-7. Emits the planned transactions in the chosen `--output-mode` shape (`safe` or `multicall`; see the modes summary above).
+5. **Filters by coinbase.** Of the checkpoints proposed by the operator's attesters, only those whose `header.coinbase == distributionWalletAddress` are counted toward the reward. Mismatched coinbases are recorded in the audit trail but dropped from the count — their rewards routed elsewhere and aren't payable from the distribution wallet. This is the integrity gate against mid-window coinbase switches; pass `--ignore-coinbase` to disable it for testnet / what-if runs.
+6. Computes the period's reward from the protocol formula: `countedCheckpoints × per-checkpoint sequencer reward`. Deterministic and reproducible — doesn't depend on whether the operator has claimed their rewards from the rollup yet.
+7. Splits the reward in proportion to each delegator's attesters' proposal count (≥1 attester per recipient), applies your commission rate, and aggregates so each unique recipient gets one transfer.
+8. Emits the planned transactions in the chosen `--output-mode` shape (`safe` or `multicall`; see the modes summary above).
 
 > **Before executing the calldata**, the operator needs to claim accrued sequencer rewards from the rollup so the distribution wallet holds enough to fund the transfers: `rollup.claimSequencerRewards(distributionWallet)`. Live mode pre-flights the wallet's balance and errors clearly if it's short. Safe mode (`--emit-calldata`) trusts the operator to fund the wallet before importing the bundle.
 
@@ -161,7 +162,8 @@ The tool **refuses to produce a plan from incomplete data**. Specifically:
 
 - **Epoch-aligned windows.** Settlement is in epochs, not blocks. An epoch lands as a single proof on L1 — when the proof is submitted, *all* rewards for that epoch are credited at once. Aligning on epochs means no proof can be split between two runs.
 - **Finalization gate.** A run **only ever considers epochs that are (a) proven on the rollup AND (b) in an L1-finalized block**. The resolver caps `--to-epoch` at the latest proven epoch and refuses any window whose proof block isn't yet L1-finalized. There's no opt-out — reorg safety is the default.
-- **Protocol-derived reward.** The amount to distribute is computed from the rollup's `getRewardConfig` and the checkpoint count: `oursProposed × (checkpointReward × sequencerBps / 10000)`. The wallet's balance isn't consulted — so the result doesn't depend on whether the operator has claimed their rewards from the rollup yet, doesn't drift if random transfers hit the wallet, and is reproducible from on-chain data alone. (Known limitation: per-checkpoint variable transaction fees aren't included; the fixed `sequencerCheckpointReward` dominates.)
+- **Protocol-derived reward.** The amount to distribute is computed from the rollup's `getRewardConfig` and the counted-checkpoint count: `countedCheckpoints × (checkpointReward × sequencerBps / 10000)`. The wallet's balance isn't consulted — so the result doesn't depend on whether the operator has claimed their rewards from the rollup yet, doesn't drift if random transfers hit the wallet, and is reproducible from on-chain data alone. (Known limitation: per-checkpoint variable transaction fees aren't included; the fixed `sequencerCheckpointReward` dominates.)
+- **Coinbase integrity gate.** Of the checkpoints proposed by the operator's attesters, only those whose `header.coinbase == distributionWalletAddress` contribute to `countedCheckpoints`. Checkpoints routed elsewhere (a mid-window coinbase switch, a misconfigured sequencer, a builder/escrow address) are recorded in the audit trail with `counted: false` and dropped from the reward. This keeps the tool from promising delegators more than actually landed in the wallet. `--ignore-coinbase` disables the filter for testnet runs and pre-funded what-if scenarios.
 - **Retry + rate limiting.** Every RPC call is retried with exponential backoff. A token-bucket rate limiter (`rpcMaxRequestsPerSecond` in config, default 100) keeps the call rate under your provider's cap so requests aren't silently dropped.
 - **All-or-nothing proposer recovery.** If any single checkpoint can't be resolved to a proposer after retries, the run **stops with an error** — it won't hand you a skewed split. Re-run (or fix the RPC, lower the rate limit, etc.) and it'll be deterministic.
 - **Deterministic by epoch.** For a fixed `[from-epoch, to-epoch]` window the result is **exact and reproducible** — two runs produce byte-identical plans. (`--to-epoch latest-proven` advances as epochs prove; pin a number for comparison.)
@@ -204,6 +206,14 @@ Options:
                               EOAs only — Safes cannot use this. Defaults:
                               `safe` with --emit-calldata, `multicall` for
                               live broadcast.
+  --ignore-coinbase           (settle) Count every operator checkpoint in the
+                              window regardless of `header.coinbase`. Default
+                              counts only checkpoints whose coinbase matches
+                              `distributionWalletAddress` — the integrity gate
+                              against mid-window switches. Use for testnet /
+                              what-if runs or when you've manually pre-funded
+                              the distribution wallet to cover a prior-coinbase
+                              period.
   --simulate-reward <amount>  (settle) Manual override of the reward amount.
                               The default is to compute the reward from the
                               protocol formula (checkpoint count × per-
