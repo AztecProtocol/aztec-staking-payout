@@ -631,7 +631,6 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
 
   // ---- 5. Calldata ----
   const plannedTxs = buildPlannedTxs({
-    multicall3: config.multicallAddress,
     token: config.tokenAddress,
     entries,
   })
@@ -829,7 +828,10 @@ async function executeLive(input: ExecuteLiveInput): Promise<void> {
     const receipt = await publicClient.waitForTransactionReceipt({ hash })
     if (receipt.status !== "success") throw new Error(`${ptx.label} reverted (tx ${hash})`)
     console.log(`  ✓ mined: ${hash}`)
-    if (ptx.function === "aggregate3") txHashes.multicall3 = hash
+    if (ptx.function === "transfer") {
+      txHashes.transfers ??= []
+      txHashes.transfers.push(hash)
+    }
   }
 }
 

@@ -1,6 +1,6 @@
 # aztec-staking-payout — technical reference
 
-Off-chain settlement runner for delegator payouts. Reads the operator's stakers from on-chain (no manual list to maintain), computes the period's reward from the rollup's protocol formula (`checkpointsProposed × checkpointReward × sequencerBps / 10000`), splits it across active delegators **in proportion to the checkpoints each delegator's attester actually proposed** (minus commission), and emits **one Multicall3 batch of ERC20.transfer calls**.
+Off-chain settlement runner for delegator payouts. Reads the operator's stakers from on-chain (no manual list to maintain), computes the period's reward from the rollup's protocol formula (`checkpointsProposed × checkpointReward × sequencerBps / 10000`), splits it across active delegators **in proportion to the checkpoints each delegator's attester actually proposed** (minus commission), and emits direct ERC20.transfer calls for the distribution wallet to execute.
 
 Self-contained: archival RPC + one config file with the commission rate and 4 addresses. No indexer dependency, no policy file, no contract deployment.
 
@@ -43,7 +43,7 @@ runner/
     discovery.ts    enumerate active delegators from chain (StakedWithProvider + IGSE.isRegistered)
     proposals.ts    count checkpoints each attester proposed (recover proposer from propose() calldata signature)
     attribution.ts  proposal-weighted split (default) + equal-split fallback
-    calldata.ts     Multicall3 ERC20.transfer batch + Safe export
+    calldata.ts     ERC20.transfer calldata + Safe export
     settle.ts       orchestrator
     audit.ts        run record writer + plan pretty-printer
     types.ts        shared types
@@ -62,7 +62,7 @@ For each `settle` run:
    - For each attester ever staked under this provider, calls `IGSE.isRegistered(rollup, attester)` to filter out exits.
    - Returns the staker (msg.sender) addresses of currently active attesters.
 5. **Attributes by actual work** (`attributionMode: proposals`, the default): scans `CheckpointProposed` events in the window, recovers each checkpoint's proposer from its `propose()` transaction signature, and splits `oursProposed × per-checkpoint sequencer reward` in proportion to how many checkpoints each delegator's attester proposed — then applies the commission rate. A delegator whose attester proposed nothing earns nothing. (`attributionMode: equal-split` requires `--simulate-reward <amount>` for the total; it has no proposal count to multiply by.) Per-delegator integer division rounds down; dust accrues to the operator.
-6. **Builds a single Multicall3 transaction** with N inner `ERC20.transfer` calls (`allowFailure = false` — atomic).
+6. **Builds one direct `ERC20.transfer` transaction per recipient**. The distribution wallet itself executes these calls, so the token balance is spent from the Safe/EOA/smart account rather than from an intermediate helper contract.
 7. **Branches on output mode**:
    - `--dry-run`: prints the plan, writes the audit record, doesn't send.
    - `--emit-calldata [<path>]`: writes a `.safe.json` next to the audit (or at `<path>` if given) for Safe Transaction Builder. No broadcast.
@@ -233,4 +233,4 @@ Signs + sends with `PRIVATE_KEY`. Signer must match `distributionWalletAddress` 
 npm test
 ```
 
-Covers attribution (proposal-weighted + equal split + dust + rounding), proposals (checkpoint scan → recover proposer from a genuinely-signed `propose()` calldata + unresolved handling), calldata (Multicall3 round-trip + Safe export), and discovery (event scan + same-tx split resolution + GSE filter + dedupe + log-chunking). All via mocked RPC — no network or chain access required.
+Covers attribution (proposal-weighted + equal split + dust + rounding), proposals (checkpoint scan → recover proposer from a genuinely-signed `propose()` calldata + unresolved handling), calldata (direct ERC20.transfer encoding + Safe export), and discovery (event scan + same-tx split resolution + GSE filter + dedupe + log-chunking). All via mocked RPC — no network or chain access required.

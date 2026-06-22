@@ -3,36 +3,6 @@ import { dirname, resolve } from "node:path"
 import { encodeFunctionData, type Address } from "viem"
 import type { DistributionEntry, PlannedTx } from "./types.js"
 
-/** Multicall3 ABI — only the function we need. */
-const MULTICALL3_ABI = [
-  {
-    name: "aggregate3",
-    type: "function",
-    stateMutability: "payable",
-    inputs: [
-      {
-        name: "calls",
-        type: "tuple[]",
-        components: [
-          { name: "target", type: "address" },
-          { name: "allowFailure", type: "bool" },
-          { name: "callData", type: "bytes" },
-        ],
-      },
-    ],
-    outputs: [
-      {
-        name: "returnData",
-        type: "tuple[]",
-        components: [
-          { name: "success", type: "bool" },
-          { name: "returnData", type: "bytes" },
-        ],
-      },
-    ],
-  },
-] as const
-
 const ERC20_TRANSFER_ABI = [
   {
     name: "transfer",
@@ -47,7 +17,6 @@ const ERC20_TRANSFER_ABI = [
 ] as const
 
 interface BuildPlannedTxsInput {
-  multicall3: Address
   token: Address
   entries: DistributionEntry[]
 }
@@ -55,59 +24,37 @@ interface BuildPlannedTxsInput {
 /**
  * Build the ordered list of planned txs for a settlement.
  *
- *   1. A single Multicall3.aggregate3 with N inner ERC20.transfer calls.
- *
  * The transfer amount is already rate-adjusted at build time (see
  * `buildDistribution` in attribution.ts) — there is no contract to apply
  * the rate server-side.
  *
- * `allowFailure` is set to FALSE on every inner call — we want the whole
- * batch to revert atomically if any single transfer fails. A partial
- * settlement is a recovery nightmare (which delegators got paid? which
- * didn't? in what order?). Multicall3's atomicity is what guarantees the
- * batch is "all or nothing".
+ * IMPORTANT: the transactions are direct ERC20.transfer calls to be executed
+ * by the distribution wallet itself. Do not wrap them in Multicall3: then the
+ * token sees Multicall3 as msg.sender and tries to spend Multicall3's balance,
+ * not the operator Safe/EOA balance.
  *
  * Returns an empty array if there are no entries — caller decides whether
  * to send a no-op tx (don't) or log and exit (do).
  */
 export function buildPlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
-  const { multicall3, token, entries } = input
-  if (entries.length === 0) return []
+  const { token, entries } = input
 
-  const innerCalls = entries.map((e) => ({
-    target: token,
-    allowFailure: false,
-    callData: encodeFunctionData({
+  return entries.map((e, i) => ({
+    label: `ERC20.transfer(${i + 1}/${entries.length}) to ${e.delegator}`,
+    to: token,
+    value: 0n,
+    data: encodeFunctionData({
       abi: ERC20_TRANSFER_ABI,
       functionName: "transfer",
       args: [e.delegator, e.amount],
     }),
-  }))
-
-  return [
-    {
-      label: `multicall3.aggregate3(${entries.length} transfers)`,
-      to: multicall3,
-      value: 0n,
-      data: encodeFunctionData({
-        abi: MULTICALL3_ABI,
-        functionName: "aggregate3",
-        args: [innerCalls],
-      }),
-      function: "aggregate3",
-      args: {
-        // Per-delegator breakdown for the audit record + cold-wallet bundle.
-        // A signer reviewing this should see the per-recipient amounts, not
-        // just an opaque calldata blob.
-        token,
-        transfers: entries.map((e) => ({
-          delegator: e.delegator,
-          amount: e.amount.toString(),
-          preRateShare: e.preRateShare.toString(),
-        })),
-      },
+    function: "transfer",
+    args: {
+      delegator: e.delegator,
+      amount: e.amount.toString(),
+      preRateShare: e.preRateShare.toString(),
     },
-  ]
+  }))
 }
 
 /** Planned transaction in the JSON-friendly shape used in the audit record. */

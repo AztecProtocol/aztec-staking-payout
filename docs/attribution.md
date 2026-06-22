@@ -43,7 +43,7 @@ Per-delegator shares (pro-rata by stake on each attester, summed across attester
 | 2 | 1000 × 100/300 = 333.33 | 600 × 300/400 = 450 | **783.33** |
 | 3 | 0 | 600 × 100/400 = 150 | **150** |
 
-The runner submits these `Total share` values onward — as the per-recipient `amount`s in the Multicall3 batch of `ERC20.transfer` calls. See [math.md](./math.md) for how the operator's commission rate is applied on top.
+The runner submits these `Total share` values onward — as the per-recipient `amount`s in direct `ERC20.transfer` calls executed by the distribution wallet. See [math.md](./math.md) for how the operator's commission rate is applied on top.
 
 ## Edge cases
 

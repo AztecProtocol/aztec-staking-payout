@@ -30,7 +30,7 @@ Note: there is no "claim" mechanism. If the operator stops running the tool, del
 
 ### 3. Run the settlement, then transfer the rest to themselves
 
-Operator distributes the per-delegator amounts via the Multicall3 batch this tool produces, then sweeps the remainder to a personal address. This is honest behaviour — the remainder is the operator's retained commission. The risk is the operator transferring **more** than the remainder, e.g., sweeping everything *before* distributing.
+Operator distributes the per-delegator amounts via the ERC20 transfer calldata this tool produces, then sweeps the remainder to a personal address. This is honest behaviour — the remainder is the operator's retained commission. The risk is the operator transferring **more** than the remainder, e.g., sweeping everything *before* distributing.
 
 **Defence:** the audit JSON records `totals.totalForwarded` and `totals.operatorRetention`; the on-chain transfer activity from the distribution wallet can be reconciled against those numbers. Any mismatch is a red flag.
 

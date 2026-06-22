@@ -2,8 +2,9 @@ import type { Address, Hex } from "viem"
 
 /**
  * A single planned on-chain transaction. Built once, then consumed by either
- * the live-send path or the calldata-emit path. A settlement is always one
- * Multicall3 transaction containing N inner ERC20.transfer calls.
+ * the live-send path or the calldata-emit path. Each settlement transfer is a
+ * direct ERC20.transfer from the distribution wallet so Safe / smart-account
+ * execution uses the wallet itself as msg.sender.
  */
 export interface PlannedTx {
   label: string
