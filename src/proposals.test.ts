@@ -149,6 +149,71 @@ const ZERO_ARGS = {
   },
 } as const
 
+// Mirror of proposals.ts PROPOSE_ABI_V5 — the v5 rollup (AZUP-2) appended
+// `accumulatedFees` to the header, changing the propose() selector.
+const PROPOSE_ABI_V5 = [
+  {
+    name: "propose",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "_args",
+        type: "tuple",
+        components: [
+          { name: "archive", type: "bytes32" },
+          { name: "oracleInput", type: "tuple", components: [{ name: "feeAssetPriceModifier", type: "int256" }] },
+          {
+            name: "header",
+            type: "tuple",
+            components: [
+              { name: "lastArchiveRoot", type: "bytes32" },
+              { name: "blockHeadersHash", type: "bytes32" },
+              { name: "blobsHash", type: "bytes32" },
+              { name: "inHash", type: "bytes32" },
+              { name: "outHash", type: "bytes32" },
+              { name: "slotNumber", type: "uint256" },
+              { name: "timestamp", type: "uint256" },
+              { name: "coinbase", type: "address" },
+              { name: "feeRecipient", type: "bytes32" },
+              {
+                name: "gasFees",
+                type: "tuple",
+                components: [
+                  { name: "feePerDaGas", type: "uint128" },
+                  { name: "feePerL2Gas", type: "uint128" },
+                ],
+              },
+              { name: "totalManaUsed", type: "uint256" },
+              { name: "accumulatedFees", type: "uint256" },
+            ],
+          },
+        ],
+      },
+      {
+        name: "_attestations",
+        type: "tuple",
+        components: [
+          { name: "signatureIndices", type: "bytes" },
+          { name: "signaturesOrAddresses", type: "bytes" },
+        ],
+      },
+      { name: "_signers", type: "address[]" },
+      {
+        name: "_attestationsAndSignersSignature",
+        type: "tuple",
+        components: [
+          { name: "v", type: "uint8" },
+          { name: "r", type: "bytes32" },
+          { name: "s", type: "bytes32" },
+        ],
+      },
+      { name: "_blobInput", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const
+
 interface Built {
   checkpointNumber: bigint
   blockNumber: bigint
@@ -159,36 +224,73 @@ interface Built {
 }
 
 /** Build a checkpoint whose propose() calldata is genuinely signed by `privKey`,
- *  so the proposer recovery exercises real ECDSA. */
+ *  so the proposer recovery exercises real ECDSA. `version` selects the
+ *  propose format and matching signature scheme:
+ *   - v4: EIP-191 message over the domain-enum-prefixed hash.
+ *   - v5: header carries `accumulatedFees`; proposer signs EIP-712 typed data
+ *     bound to the rollup + chain (raw-digest recovery, no EIP-191 prefix) —
+ *     mirroring CoordinationSignatureLib.attestationsAndSignersDigest. */
 async function buildCheckpoint(
   privKey: Hex,
   checkpointNumber: bigint,
   blockNumber: bigint,
   wrap = false,
   coinbase: Address = "0x0000000000000000000000000000000000000000" as Address,
+  version: "v4" | "v5" = "v4",
 ): Promise<Built> {
   const account = privateKeyToAccount(privKey)
   const attestations = { signatureIndices: "0x00" as Hex, signaturesOrAddresses: "0x" as Hex }
   const signers: Address[] = []
-  const digest = keccak256(
-    encodeAbiParameters(
-      [{ type: "uint8" }, ATTEST_TUPLE, { type: "address[]" }],
-      [DOMAIN_ATTESTATIONS_AND_SIGNERS, attestations, signers],
-    ),
-  )
-  const sigHex = await account.signMessage({ message: { raw: digest } })
+  const sigHex =
+    version === "v4"
+      ? await account.signMessage({
+          message: {
+            raw: keccak256(
+              encodeAbiParameters(
+                [{ type: "uint8" }, ATTEST_TUPLE, { type: "address[]" }],
+                [DOMAIN_ATTESTATIONS_AND_SIGNERS, attestations, signers],
+              ),
+            ),
+          },
+        })
+      : await account.signTypedData({
+          domain: { name: "Aztec Rollup", version: "1", chainId: 1, verifyingContract: ROLLUP },
+          types: { AttestationsAndSigners: [{ name: "payloadHash", type: "bytes32" }] },
+          primaryType: "AttestationsAndSigners",
+          message: {
+            payloadHash: keccak256(
+              encodeAbiParameters([ATTEST_TUPLE, { type: "address[]" }], [attestations, signers]),
+            ),
+          },
+        })
   const { r, s, v, yParity } = parseSignature(sigHex)
+  const sig = { v: Number(v ?? BigInt(yParity + 27)), r, s }
   // Override the coinbase field of ZERO_ARGS so the tx encodes the requested
   // coinbase — recoverProposerAndCoinbaseFromCalldata decodes it back out.
-  const argsWithCoinbase = {
-    ...ZERO_ARGS,
-    header: { ...ZERO_ARGS.header, coinbase },
-  }
-  const proposeCalldata = encodeFunctionData({
-    abi: PROPOSE_ABI,
-    functionName: "propose",
-    args: [argsWithCoinbase, attestations, signers, { v: Number(v ?? BigInt(yParity + 27)), r, s }, "0x"],
-  })
+  const proposeCalldata =
+    version === "v4"
+      ? encodeFunctionData({
+          abi: PROPOSE_ABI,
+          functionName: "propose",
+          args: [
+            { ...ZERO_ARGS, header: { ...ZERO_ARGS.header, coinbase } },
+            attestations,
+            signers,
+            sig,
+            "0x",
+          ],
+        })
+      : encodeFunctionData({
+          abi: PROPOSE_ABI_V5,
+          functionName: "propose",
+          args: [
+            { ...ZERO_ARGS, header: { ...ZERO_ARGS.header, coinbase, accumulatedFees: 0n } },
+            attestations,
+            signers,
+            sig,
+            "0x",
+          ],
+        })
   const calldata = wrap ? wrapInAggregate3(proposeCalldata) : proposeCalldata
   // Two propose() calls at the same checkpointNumber (e.g. one pruned, one
   // re-proposed) are distinct transactions in reality. Bake blockNumber into
@@ -461,6 +563,44 @@ describe("countProposalsByProposer", () => {
     const built = [await buildCheckpoint(KEY_A, 1n, 50n)]
     const out = await run(built)
     expect(out.outOfRangeCheckpoints).toBe(0)
+  })
+
+  it("recovers the proposer from v5-format propose() txs (EIP-712 digest, accumulatedFees header)", async () => {
+    const zero = "0x0000000000000000000000000000000000000000" as Address
+    const built = [
+      await buildCheckpoint(KEY_A, 1n, 50n, false, zero, "v5"),
+      await buildCheckpoint(KEY_A, 2n, 51n, false, zero, "v5"),
+      await buildCheckpoint(KEY_B, 3n, 52n, true, zero, "v5"), // wrapped in aggregate3
+    ]
+    const A = privateKeyToAccount(KEY_A).address.toLowerCase()
+    const B = privateKeyToAccount(KEY_B).address.toLowerCase()
+    const out = await run(built)
+    expect(out.resolvedCheckpoints).toBe(3)
+    expect(out.unresolvedCheckpoints).toBe(0)
+    expect(out.countsByProposer.get(A)).toBe(2)
+    expect(out.countsByProposer.get(B)).toBe(1)
+  })
+
+  it("decodes header.coinbase from v5 propose() calldata", async () => {
+    const WALLET = getAddress("0x3333333333333333333333333333333333333333") as Address
+    const built = [await buildCheckpoint(KEY_A, 1n, 50n, false, WALLET, "v5")]
+    const out = await run(built)
+    expect(out.resolvedCheckpoints).toBe(1)
+    expect(out.attributed[0]?.coinbase).toBe(WALLET)
+  })
+
+  it("handles a window mixing v4 and v5 propose formats (upgrade boundary)", async () => {
+    const zero = "0x0000000000000000000000000000000000000000" as Address
+    const built = [
+      await buildCheckpoint(KEY_A, 1n, 50n), // v4
+      await buildCheckpoint(KEY_B, 2n, 51n, false, zero, "v5"),
+    ]
+    const A = privateKeyToAccount(KEY_A).address.toLowerCase()
+    const B = privateKeyToAccount(KEY_B).address.toLowerCase()
+    const out = await run(built)
+    expect(out.resolvedCheckpoints).toBe(2)
+    expect(out.countsByProposer.get(A)).toBe(1)
+    expect(out.countsByProposer.get(B)).toBe(1)
   })
 
   it("emits scanning + recovering progress phases", async () => {
