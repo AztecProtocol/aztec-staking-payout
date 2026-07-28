@@ -3,8 +3,10 @@ import {
   decodeFunctionData,
   encodeAbiParameters,
   getAddress,
+  hashTypedData,
   keccak256,
   parseAbiItem,
+  recoverAddress,
   recoverMessageAddress,
   toFunctionSelector,
   type Address,
@@ -35,72 +37,87 @@ export const CHECKPOINT_PROPOSED_EVENT = parseAbiItem(
  * The `propose()` function ABI — used to decode the transaction calldata. We
  * only consume `_attestations`, `_signers` and `_attestationsAndSignersSignature`,
  * but ABI decoding is positional so the full shape is required.
+ *
+ * Two variants exist on mainnet. The v5 rollup (AZUP-2 upgrade) appended
+ * `accumulatedFees` to `ProposedHeader` (ProposedHeaderLib.sol), changing the
+ * function selector; every other parameter — attestations, signers, the
+ * proposer's signature, blob input — is positionally identical, and
+ * `header.coinbase` sits at the same component index. We build both ABIs from
+ * a shared template and pick by selector at decode time, so settlements on
+ * either rollup (and historical re-verification of v4 audits) keep working.
  */
-const PROPOSE_ABI = [
-  {
-    name: "propose",
-    type: "function",
-    stateMutability: "nonpayable",
-    inputs: [
-      {
-        name: "_args",
-        type: "tuple",
-        components: [
-          { name: "archive", type: "bytes32" },
-          {
-            name: "oracleInput",
-            type: "tuple",
-            components: [{ name: "feeAssetPriceModifier", type: "int256" }],
-          },
-          {
-            name: "header",
-            type: "tuple",
-            components: [
-              { name: "lastArchiveRoot", type: "bytes32" },
-              { name: "blockHeadersHash", type: "bytes32" },
-              { name: "blobsHash", type: "bytes32" },
-              { name: "inHash", type: "bytes32" },
-              { name: "outHash", type: "bytes32" },
-              { name: "slotNumber", type: "uint256" },
-              { name: "timestamp", type: "uint256" },
-              { name: "coinbase", type: "address" },
-              { name: "feeRecipient", type: "bytes32" },
-              {
-                name: "gasFees",
-                type: "tuple",
-                components: [
-                  { name: "feePerDaGas", type: "uint128" },
-                  { name: "feePerL2Gas", type: "uint128" },
-                ],
-              },
-              { name: "totalManaUsed", type: "uint256" },
-            ],
-          },
-        ],
-      },
-      {
-        name: "_attestations",
-        type: "tuple",
-        components: [
-          { name: "signatureIndices", type: "bytes" },
-          { name: "signaturesOrAddresses", type: "bytes" },
-        ],
-      },
-      { name: "_signers", type: "address[]" },
-      {
-        name: "_attestationsAndSignersSignature",
-        type: "tuple",
-        components: [
-          { name: "v", type: "uint8" },
-          { name: "r", type: "bytes32" },
-          { name: "s", type: "bytes32" },
-        ],
-      },
-      { name: "_blobInput", type: "bytes" },
-    ],
-    outputs: [],
-  },
-] as const
+const buildProposeAbi = (headerExtraComponents: readonly { name: string; type: string }[]) =>
+  [
+    {
+      name: "propose",
+      type: "function",
+      stateMutability: "nonpayable",
+      inputs: [
+        {
+          name: "_args",
+          type: "tuple",
+          components: [
+            { name: "archive", type: "bytes32" },
+            {
+              name: "oracleInput",
+              type: "tuple",
+              components: [{ name: "feeAssetPriceModifier", type: "int256" }],
+            },
+            {
+              name: "header",
+              type: "tuple",
+              components: [
+                { name: "lastArchiveRoot", type: "bytes32" },
+                { name: "blockHeadersHash", type: "bytes32" },
+                { name: "blobsHash", type: "bytes32" },
+                { name: "inHash", type: "bytes32" },
+                { name: "outHash", type: "bytes32" },
+                { name: "slotNumber", type: "uint256" },
+                { name: "timestamp", type: "uint256" },
+                { name: "coinbase", type: "address" },
+                { name: "feeRecipient", type: "bytes32" },
+                {
+                  name: "gasFees",
+                  type: "tuple",
+                  components: [
+                    { name: "feePerDaGas", type: "uint128" },
+                    { name: "feePerL2Gas", type: "uint128" },
+                  ],
+                },
+                { name: "totalManaUsed", type: "uint256" },
+                ...headerExtraComponents,
+              ],
+            },
+          ],
+        },
+        {
+          name: "_attestations",
+          type: "tuple",
+          components: [
+            { name: "signatureIndices", type: "bytes" },
+            { name: "signaturesOrAddresses", type: "bytes" },
+          ],
+        },
+        { name: "_signers", type: "address[]" },
+        {
+          name: "_attestationsAndSignersSignature",
+          type: "tuple",
+          components: [
+            { name: "v", type: "uint8" },
+            { name: "r", type: "bytes32" },
+            { name: "s", type: "bytes32" },
+          ],
+        },
+        { name: "_blobInput", type: "bytes" },
+      ],
+      outputs: [],
+    },
+  ] as const
+
+/** v4 rollup: header ends at `totalManaUsed`. */
+const PROPOSE_ABI_V4 = buildProposeAbi([])
+/** v5 rollup (AZUP-2): header gained `accumulatedFees`. */
+const PROPOSE_ABI_V5 = buildProposeAbi([{ name: "accumulatedFees", type: "uint256" }])
 
 /**
  * Sequencers commonly submit `propose()` wrapped inside a Multicall3 batch
@@ -146,38 +163,57 @@ const AGGREGATE_ABI = [
   },
 ] as const
 
-const PROPOSE_SELECTOR = toFunctionSelector(PROPOSE_ABI[0]).toLowerCase()
+/** Known `propose()` selectors → the ABI that decodes them and the rollup
+ *  version, which determines the proposer-signature digest scheme (v4 signs
+ *  an EIP-191 message over a domain-enum-prefixed hash; v5 signs EIP-712
+ *  typed data bound to the rollup contract — see
+ *  `recoverProposerAndCoinbaseFromCalldata`). */
+type ProposeVariant = {
+  abi: typeof PROPOSE_ABI_V4 | typeof PROPOSE_ABI_V5
+  version: "v4" | "v5"
+}
+const PROPOSE_ABI_BY_SELECTOR = new Map<string, ProposeVariant>([
+  [toFunctionSelector(PROPOSE_ABI_V4[0]).toLowerCase(), { abi: PROPOSE_ABI_V4, version: "v4" }],
+  [toFunctionSelector(PROPOSE_ABI_V5[0]).toLowerCase(), { abi: PROPOSE_ABI_V5, version: "v5" }],
+])
 const AGGREGATE3_SELECTOR = toFunctionSelector(AGGREGATE3_ABI[0]).toLowerCase()
 const AGGREGATE_SELECTOR = toFunctionSelector(AGGREGATE_ABI[0]).toLowerCase()
 
 /**
  * Extract the `propose()` calldata from a transaction's input — whether the
  * sequencer called `propose()` directly or wrapped it in a Multicall3
- * `aggregate3`/`aggregate` batch. Prefers an inner call targeting the rollup,
- * but falls back to any inner call bearing the `propose()` selector.
+ * `aggregate3`/`aggregate` batch. Matches any known propose variant (v4 or
+ * v5 selector). Prefers an inner call targeting the rollup, but falls back
+ * to any inner call bearing a `propose()` selector.
  */
 function extractProposeCalldata(input: Hex, rollupAddress: Address): Hex {
   const sel = input.slice(0, 10).toLowerCase()
-  if (sel === PROPOSE_SELECTOR) return input
+  if (PROPOSE_ABI_BY_SELECTOR.has(sel)) return input
 
-  const pickProposeCall = (calls: readonly { target: Address; callData: Hex }[]): Hex | undefined => {
-    const isPropose = (d: Hex) => d.slice(0, 10).toLowerCase() === PROPOSE_SELECTOR
-    const toRollup = calls.find(
-      (c) => isPropose(c.callData) && c.target.toLowerCase() === rollupAddress.toLowerCase(),
-    )
-    return (toRollup ?? calls.find((c) => isPropose(c.callData)))?.callData
-  }
+  const aggAbi =
+    sel === AGGREGATE3_SELECTOR ? AGGREGATE3_ABI : sel === AGGREGATE_SELECTOR ? AGGREGATE_ABI : null
+  const calls = aggAbi
+    ? (decodeFunctionData({ abi: aggAbi, data: input }).args[0] as readonly {
+        target: Address
+        callData: Hex
+      }[])
+    : []
+  const isPropose = (d: Hex) => PROPOSE_ABI_BY_SELECTOR.has(d.slice(0, 10).toLowerCase())
+  const inner =
+    calls.find((c) => isPropose(c.callData) && c.target.toLowerCase() === rollupAddress.toLowerCase()) ??
+    calls.find((c) => isPropose(c.callData))
+  if (inner) return inner.callData
 
-  if (sel === AGGREGATE3_SELECTOR) {
-    const { args } = decodeFunctionData({ abi: AGGREGATE3_ABI, data: input })
-    const inner = pickProposeCall(args[0] as readonly { target: Address; callData: Hex }[])
-    if (inner) return inner
-  } else if (sel === AGGREGATE_SELECTOR) {
-    const { args } = decodeFunctionData({ abi: AGGREGATE_ABI, data: input })
-    const inner = pickProposeCall(args[0] as readonly { target: Address; callData: Hex }[])
-    if (inner) return inner
-  }
-  throw new Error(`no propose() call found in tx (outer selector ${sel})`)
+  // Name the unrecognised inner selectors, not just the outer wrapper — the
+  // wrapper is usually Multicall3 and says nothing about the real mismatch
+  // when a new rollup version changes the propose() signature.
+  const innerSelectors = calls.map((c) => c.callData.slice(0, 10).toLowerCase())
+  throw new Error(
+    `no known propose() call found in tx (outer selector ${sel}` +
+      (innerSelectors.length > 0 ? `; inner selectors ${innerSelectors.join(", ")}` : ``) +
+      `). Known propose selectors: ${[...PROPOSE_ABI_BY_SELECTOR.keys()].join(", ")} — ` +
+      `a new rollup version may have changed the propose() signature.`,
+  )
 }
 
 /** ABI parameter shapes for the attestations-and-signers digest preimage. */
@@ -191,10 +227,21 @@ const ATTESTATIONS_TUPLE = {
 
 /**
  * `SignatureDomainSeparator.attestationsAndSigners` — enum index 2
- * (AttestationLib.sol: checkpointProposal=0, checkpointAttestation=1,
- * attestationsAndSigners=2). Mixed into the digest the proposer signs.
+ * (v4 AttestationLib.sol: checkpointProposal=0, checkpointAttestation=1,
+ * attestationsAndSigners=2). Mixed into the digest the proposer signs on v4.
  */
 const DOMAIN_ATTESTATIONS_AND_SIGNERS = 2
+
+/** v5 signs EIP-712 typed data: domain ("Aztec Rollup", "1", chainId,
+ *  rollupAddress) over `AttestationsAndSigners(bytes32 payloadHash)` where
+ *  payloadHash = keccak256(abi.encode(_attestations, _signers)) — see
+ *  AttestationLib.getAttestationsAndSignersDigest →
+ *  CoordinationSignatureLib.attestationsAndSignersDigest. */
+const V5_EIP712_DOMAIN_NAME = "Aztec Rollup"
+const V5_EIP712_DOMAIN_VERSION = "1"
+const V5_EIP712_TYPES = {
+  AttestationsAndSigners: [{ name: "payloadHash", type: "bytes32" }],
+} as const
 
 type DecodedAttestations = { signatureIndices: Hex; signaturesOrAddresses: Hex }
 type DecodedSignature = { v: number; r: Hex; s: Hex }
@@ -203,11 +250,19 @@ type DecodedSignature = { v: number; r: Hex; s: Hex }
  * Decode `proposer` (from the signature) and `coinbase` (from
  * `_args.header.coinbase`) of a checkpoint from its `propose()` calldata.
  *
- * The proposer signs `keccak256(abi.encode(attestationsAndSigners,
- * _attestations, _signers))` (EIP-191 prefixed) — see
- * `ValidatorSelectionLib.verifyProposer`. Recovering that signer yields the
- * proposer attester address directly, with no committee sampling, seed, or
- * historical state.
+ * The proposer signs over `_attestations` and `_signers`; recovering that
+ * signer yields the proposer attester address directly, with no committee
+ * sampling, seed, or historical state. The digest scheme differs by rollup
+ * version (selected via the propose() selector):
+ *
+ *   - v4: EIP-191 personal message over
+ *     `keccak256(abi.encode(uint8(2), _attestations, _signers))`
+ *     (ValidatorSelectionLib.verifyProposer, AttestationLib domain enum).
+ *   - v5: EIP-712 typed data — domain ("Aztec Rollup", "1", chainId, rollup)
+ *     over `AttestationsAndSigners(bytes32 payloadHash)` with
+ *     `payloadHash = keccak256(abi.encode(_attestations, _signers))`;
+ *     recovered from the RAW digest (no EIP-191 prefix) —
+ *     CoordinationSignatureLib.attestationsAndSignersDigest.
  *
  * The coinbase is the address the rollup credits with `sequencerRewards[…]`
  * for this checkpoint — i.e. the wallet that *actually* gets paid. We surface
@@ -219,9 +274,13 @@ type DecodedSignature = { v: number; r: Hex; s: Hex }
 async function recoverProposerAndCoinbaseFromCalldata(
   input: Hex,
   rollupAddress: Address,
+  chainId: number,
 ): Promise<{ proposer: Address; coinbase: Address }> {
   const proposeData = extractProposeCalldata(input, rollupAddress)
-  const { args } = decodeFunctionData({ abi: PROPOSE_ABI, data: proposeData })
+  // Selector is guaranteed known here — extractProposeCalldata only returns
+  // calldata whose selector is in the map.
+  const variant = PROPOSE_ABI_BY_SELECTOR.get(proposeData.slice(0, 10).toLowerCase())!
+  const { args } = decodeFunctionData({ abi: variant.abi, data: proposeData })
   // _args.header.coinbase — element 0 of the args tuple, then `.header.coinbase`.
   const argsTuple = args[0] as { header: { coinbase: Address } }
   const coinbase = argsTuple.header.coinbase
@@ -229,16 +288,41 @@ async function recoverProposerAndCoinbaseFromCalldata(
   const signers = args[2] as readonly Address[]
   const signature = args[3] as DecodedSignature
 
-  const digest = keccak256(
-    encodeAbiParameters(
-      [{ type: "uint8" }, ATTESTATIONS_TUPLE, { type: "address[]" }],
-      [DOMAIN_ATTESTATIONS_AND_SIGNERS, attestations, signers as Address[]],
-    ),
-  )
-  const proposer = await recoverMessageAddress({
-    message: { raw: digest },
-    signature: { r: signature.r, s: signature.s, v: BigInt(signature.v) },
-  })
+  let proposer: Address
+  if (variant.version === "v4") {
+    const digest = keccak256(
+      encodeAbiParameters(
+        [{ type: "uint8" }, ATTESTATIONS_TUPLE, { type: "address[]" }],
+        [DOMAIN_ATTESTATIONS_AND_SIGNERS, attestations, signers as Address[]],
+      ),
+    )
+    proposer = await recoverMessageAddress({
+      message: { raw: digest },
+      signature: { r: signature.r, s: signature.s, v: BigInt(signature.v) },
+    })
+  } else {
+    const payloadHash = keccak256(
+      encodeAbiParameters(
+        [ATTESTATIONS_TUPLE, { type: "address[]" }],
+        [attestations, signers as Address[]],
+      ),
+    )
+    const digest = hashTypedData({
+      domain: {
+        name: V5_EIP712_DOMAIN_NAME,
+        version: V5_EIP712_DOMAIN_VERSION,
+        chainId,
+        verifyingContract: rollupAddress,
+      },
+      types: V5_EIP712_TYPES,
+      primaryType: "AttestationsAndSigners",
+      message: { payloadHash },
+    })
+    proposer = await recoverAddress({
+      hash: digest,
+      signature: { r: signature.r, s: signature.s, v: BigInt(signature.v) },
+    })
+  }
   return { proposer, coinbase }
 }
 
@@ -433,6 +517,9 @@ export async function countProposalsByProposer(
   //         `sequencerRewards[…]` on, so the caller can gate "this counted
   //         toward our payout" on it. ----
   const uniqueTxs = [...new Set(dedupedEvents.map((e) => e.txHash))]
+  // One eth_chainId up front — the v5 digest is EIP-712 and binds the chain id
+  // (and the rollup address, which we already have) into the signed payload.
+  const chainId = await withRetry(() => client.getChainId(), undefined, undefined, retryMeter)
   const decodedByTx = new Map<Hex, { proposer: Address; coinbase: Address }>()
   const recordUnresolved = (msg: string) => {
     if (counts.firstUnresolvedError === undefined) counts.firstUnresolvedError = msg
@@ -457,6 +544,7 @@ export async function countProposalsByProposer(
       const { proposer, coinbase } = await recoverProposerAndCoinbaseFromCalldata(
         calldata,
         rollupAddress,
+        chainId,
       )
       decodedByTx.set(txHash, { proposer: getAddress(proposer), coinbase: getAddress(coinbase) })
     } catch (e) {

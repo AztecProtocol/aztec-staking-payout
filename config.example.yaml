@@ -94,7 +94,13 @@ stakingRegistryAddress: "0x042dF8f42790d6943F41C25C2132400fd727f452"
 
 # Rollup instance the operator stakes against. Used to derive GSE via
 # getGSE() and to check active attester status via isRegistered.
-rollupAddress: "0xAe2001f7e21d5EcABf6234E9FDd1E76F50F74962"
+# NOTE: each protocol upgrade deploys a NEW rollup contract with its own
+# epoch/checkpoint numbering starting at 0 — after an upgrade, point this at
+# the new rollup and settle its epochs from 0. The old address stays valid
+# for re-verifying historical audits of pre-upgrade windows.
+#   v5 (AZUP-2, current): 0x91fF8bbD8Ebb07893010D50A48A1609e5EBd8E34
+#   v4 (frozen at epoch 4951): 0xAe2001f7e21d5EcABf6234E9FDd1E76F50F74962
+rollupAddress: "0x91fF8bbD8Ebb07893010D50A48A1609e5EBd8E34"
 
 # ─── Operator-specific (set these per operator) ─────────────────────────────
 
