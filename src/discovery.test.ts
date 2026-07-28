@@ -42,6 +42,10 @@ interface StakeFixture {
   blockNumber: bigint
   /** Currently registered in GSE? */
   active: boolean
+  /** If set, `isRegistered` returns `true` only for eth_calls with a block
+   *  tag `< exitAtBlock` (attester exited at this block). If unset, `active`
+   *  applies at every block. Ignored when `active === false`. */
+  exitAtBlock?: bigint
   /** If active: registered under the bonus instance (moveWithLatestRollup
    *  =true, the default/common case) vs the rollup instance (=false). */
   viaBonus?: boolean
@@ -163,7 +167,9 @@ function makeMockTransport(fixtures: StakeFixture[]) {
   })
 
   // Dispatch a single eth_call (target + calldata) → ABI-encoded hex result.
-  function singleCall(to: string, data: Hex): Hex {
+  // `atBlock` is the block tag from the outer eth_call; `isRegistered`
+  // consults it so we can simulate an attester that exited mid-window.
+  function singleCall(to: string, data: Hex, atBlock: bigint): Hex {
     const toL = to.toLowerCase()
     const sel = data.slice(0, 10).toLowerCase()
     if (toL === ROLLUP.toLowerCase() && sel === getGSESelector) {
@@ -188,7 +194,9 @@ function makeMockTransport(fixtures: StakeFixture[]) {
       const [instance, attester] = args as readonly [Address, Address]
       const fix = fixtures.find((f) => f.attester.toLowerCase() === attester.toLowerCase())
       let registered = false
-      if (fix?.active) {
+      const activeAtBlock =
+        fix?.active === true && (fix.exitAtBlock === undefined || atBlock < fix.exitAtBlock)
+      if (activeAtBlock && fix) {
         const viaBonus = fix.viaBonus !== false // default true
         if (instance.toLowerCase() === ROLLUP.toLowerCase()) registered = !viaBonus
         else if (instance.toLowerCase() === BONUS_INSTANCE.toLowerCase()) registered = viaBonus
@@ -273,7 +281,16 @@ function makeMockTransport(fixtures: StakeFixture[]) {
           }
         }
         case "eth_call": {
-          const call = (params as Array<{ to: string; data: Hex }>)[0]!
+          const p = params as [{ to: string; data: Hex }, string | undefined]
+          const call = p[0]
+          const blockTag = p[1]
+          // If the caller didn't pin a block ("latest" / undefined), default
+          // to a very high block so any `exitAtBlock` fixture still counts
+          // the attester as active.
+          const atBlock =
+            blockTag === undefined || blockTag === "latest" || blockTag === "pending"
+              ? 2n ** 64n
+              : BigInt(blockTag)
           const data = call.data
           // Multicall3.aggregate3 → decode inner calls, dispatch each, wrap.
           if (
@@ -284,7 +301,7 @@ function makeMockTransport(fixtures: StakeFixture[]) {
             const calls = args[0] as readonly { target: Address; allowFailure: boolean; callData: Hex }[]
             const returnData = calls.map((c) => {
               try {
-                return { success: true, returnData: singleCall(c.target, c.callData) }
+                return { success: true, returnData: singleCall(c.target, c.callData, atBlock) }
               } catch (e) {
                 if (!c.allowFailure) throw e
                 return { success: false, returnData: "0x" as Hex }
@@ -292,7 +309,7 @@ function makeMockTransport(fixtures: StakeFixture[]) {
             })
             return encodeFunctionResult({ abi: AGGREGATE3_ABI, functionName: "aggregate3", result: returnData })
           }
-          return singleCall(call.to, data)
+          return singleCall(call.to, data, atBlock)
         }
         default:
           throw new Error(`mock: unsupported method ${method}`)
@@ -567,6 +584,86 @@ describe("discoverActiveDelegators", () => {
     })
     expect(out).toHaveLength(3)
     expect(out.map((d) => d.delegator)).toEqual([addr("e1"), addr("e2"), addr("e3")])
+  })
+
+  it("keeps attesters that were active at fromBlock but exited before toBlock (union over activityCheckBlocks)", async () => {
+    // The bug this test guards: without the multi-block union, an attester
+    // whose exit finalized between fromBlock and toBlock would be filtered
+    // out at toBlock and their in-window proposals silently dropped.
+    const fixtures: StakeFixture[] = [
+      {
+        attester: addr("a1"),
+        staker: addr("d1"),
+        userRewardsRecipient: addr("e1"),
+        split: addr("51"),
+        blockNumber: 100n,
+        active: true,
+        // Registered up to (but not including) block 800, then exited.
+        exitAtBlock: 800n,
+      },
+      {
+        attester: addr("a2"),
+        staker: addr("d2"),
+        userRewardsRecipient: addr("e2"),
+        split: addr("52"),
+        blockNumber: 200n,
+        active: true, // still registered at every block
+      },
+    ]
+    const client = makeClient(fixtures)
+    const { delegators, stats } = await discoverActiveDelegators({
+      client,
+      stakingRegistryAddress: STAKING_REGISTRY,
+      rollupAddress: ROLLUP,
+      multicallAddress: MULTICALL3,
+      providerId: 42n,
+      fromBlock: 0n,
+      toBlock: 1000n,
+      logChunkSize: 10000n,
+      // Settlement window: a1 was active at 500 but exited by 900.
+      activityCheckBlocks: [500n, 900n],
+    })
+    // Both attesters must survive — a1 via the fromBlock probe, a2 via both.
+    expect(delegators.map((d) => d.attester).sort()).toEqual([addr("a1"), addr("a2")].sort())
+    expect(stats.registeredOnRollup).toBe(2)
+    expect(stats.phantomAttesters).toEqual([])
+  })
+
+  it("reports phantom attesters — staked but never registered at any check block", async () => {
+    const fixtures: StakeFixture[] = [
+      {
+        attester: addr("a1"),
+        staker: addr("d1"),
+        userRewardsRecipient: addr("e1"),
+        split: addr("51"),
+        blockNumber: 100n,
+        active: true,
+      },
+      {
+        attester: addr("a2"),
+        staker: addr("d2"),
+        userRewardsRecipient: addr("e2"),
+        split: addr("52"),
+        blockNumber: 200n,
+        // Staked but never activated — a "phantom" (or entirely exited
+        // pre-window).
+        active: false,
+      },
+    ]
+    const client = makeClient(fixtures)
+    const { delegators, stats } = await discoverActiveDelegators({
+      client,
+      stakingRegistryAddress: STAKING_REGISTRY,
+      rollupAddress: ROLLUP,
+      multicallAddress: MULTICALL3,
+      providerId: 42n,
+      fromBlock: 0n,
+      toBlock: 1000n,
+      logChunkSize: 10000n,
+      activityCheckBlocks: [500n, 900n],
+    })
+    expect(delegators.map((d) => d.attester)).toEqual([addr("a1")])
+    expect(stats.phantomAttesters).toEqual([addr("a2")])
   })
 
   it("emits progress events through all three phases", async () => {

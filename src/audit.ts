@@ -106,10 +106,12 @@ export interface AuditRecord {
   }
 
   /** Shape of the planned transactions: `safe` = N top-level `ERC20.transfer`
-   *  calls (one per delegator, the Safe wraps them in MultiSend); `multicall`
-   *  = optional `ERC20.approve(Multicall3, total)` followed by
-   *  `Multicall3.aggregate3([transferFrom, ...])` (for plain EOAs). */
-  outputMode: "safe" | "multicall"
+   *  calls (one per delegator, the Safe wraps them in MultiSend); `disperse`
+   *  = optional `ERC20.approve(Disperse, total)` followed by
+   *  `Disperse.disperseTokenSimple(token, recipients, amounts)` (for plain
+   *  EOAs). An earlier `multicall` value existed and was removed after a
+   *  live drain incident — do not reintroduce it. */
+  outputMode: "safe" | "disperse"
 
   /** The encoded on-chain transactions this settlement produces.
    *  Self-contained — an auditor / cold-wallet signer can replay these

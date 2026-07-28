@@ -87,22 +87,31 @@ Options:
                               breakdown + encoded calldata live in the audit
                               JSON — no separate summary file is written.
   --output-mode <mode>        (settle) Shape of the planned transactions:
-                                safe       N top-level ERC20.transfer calls
-                                           (one per delegator). The Safe wraps
-                                           them in MultiSend; works for Safes,
-                                           smart-account wallets, and cold-
-                                           wallet EOAs signing one by one.
-                                multicall  Optional ERC20.approve(Multicall3,
-                                           total) + Multicall3.aggregate3 of
-                                           N transferFrom calls. Fewer txs,
-                                           but requires a plain EOA — Safes
-                                           CANNOT use this (the inner transfer
-                                           reverts with insufficient balance
-                                           on Multicall3).
+                                safe      N top-level ERC20.transfer calls
+                                          (one per delegator). The Safe wraps
+                                          them in MultiSend; works for Safes,
+                                          smart-account wallets, and cold-
+                                          wallet EOAs signing one by one.
+                                disperse  Optional ERC20.approve(Disperse,
+                                          total) + Disperse.disperseTokenSimple
+                                          of N transferFroms. Fewer txs. Safe
+                                          under a mempool race because Disperse
+                                          calls transferFrom(msg.sender, …)
+                                          internally — only the operator's own
+                                          call can spend the operator's
+                                          allowance to Disperse.
+                                          (An earlier 'multicall' mode used
+                                          Multicall3.aggregate3 of transferFrom
+                                          calls; it was removed after a live
+                                          drain incident. Multicall3 lets any
+                                          caller pick an arbitrary 'from' for
+                                          its inner calls, so anyone could
+                                          drain the operator's Multicall3
+                                          allowance between the approve tx and
+                                          the aggregate3 tx. Do not
+                                          reintroduce this pattern.)
                               Defaults: 'safe' with --emit-calldata,
-                              'multicall' for live broadcast. Pin explicitly
-                              for a cold-wallet EOA that wants the batched
-                              shape via --emit-calldata.
+                              'disperse' for live broadcast.
   --ignore-coinbase           (settle) Count every checkpoint proposed by the
                               operator's attesters in the window regardless of
                               the per-checkpoint header.coinbase. By default
@@ -187,8 +196,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       out.simulateReward = parseAmount(required(args[i++], "--simulate-reward"))
     else if (arg === "--output-mode") {
       const v = required(args[i++], "--output-mode")
-      if (v !== "safe" && v !== "multicall") {
-        process.stderr.write(`--output-mode must be 'safe' or 'multicall', got: ${v}\n`)
+      if (v !== "safe" && v !== "disperse") {
+        process.stderr.write(`--output-mode must be 'safe' or 'disperse', got: ${v}\n`)
         process.exit(1)
       }
       out.outputMode = v

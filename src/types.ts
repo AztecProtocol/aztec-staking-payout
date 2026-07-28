@@ -3,28 +3,37 @@ import type { Address, Hex } from "viem"
 /**
  * How the settlement transactions are shaped.
  *
- *   "safe"      – N top-level `ERC20.transfer(delegator, amount)` calls, one
- *                 per recipient. The Safe (or other smart-account UI) bundles
- *                 them via its own MultiSend, which delegatecalls so the Safe
- *                 stays `msg.sender` on every inner transfer. Tokens flow
- *                 from the Safe directly. No approval required.
+ *   "safe"     – N top-level `ERC20.transfer(delegator, amount)` calls, one
+ *                per recipient. The Safe (or other smart-account UI) bundles
+ *                them via its own MultiSend, which delegatecalls so the Safe
+ *                stays `msg.sender` on every inner transfer. Tokens flow
+ *                from the Safe directly. No approval required.
  *
- *                 Required for Safes — they cannot use the `multicall` mode
- *                 (Multicall3 calls inner transfers via plain CALL, which
- *                 makes Multicall3 the `msg.sender` and the transfer
- *                 reverts with insufficient balance on Multicall3).
+ *                Required for Safes — they cannot use `disperse` either
+ *                (works but is redundant with Safe's own MultiSend).
  *
- *   "multicall" – Two txs at most: an optional `ERC20.approve(Multicall3, total)`
- *                 (skipped when existing allowance already covers `total`),
- *                 then `Multicall3.aggregate3([ERC20.transferFrom(wallet,
- *                 delegator_i, amount_i), ...])`. Multicall3 pulls from the
- *                 distribution wallet under the approval. Fewer txs than
- *                 `safe` mode, atomic on the aggregate3 step.
+ *   "disperse" – Two txs at most: an optional `ERC20.approve(Disperse, total)`
+ *                (skipped when existing allowance already covers `total`),
+ *                then `Disperse.disperseTokenSimple(token, recipients,
+ *                amounts)` at `config.disperseAddress`. Disperse calls
+ *                `token.transferFrom(msg.sender, recipients[i], amounts[i])`
+ *                for each recipient in a single tx. Fewer txs than `safe`
+ *                mode, atomic in one call.
  *
- *                 Intended for plain EOAs that want to settle many delegators
- *                 in a single batch transaction. Does NOT work for Safes.
+ *                Safe under a race because Disperse uses `msg.sender`
+ *                internally: the operator's approval to Disperse can only
+ *                be consumed by the operator calling Disperse (any attacker
+ *                calling Disperse would spend their own allowance, not the
+ *                operator's).
+ *
+ *                Intended for plain EOAs. An earlier `multicall` mode used
+ *                `Multicall3.aggregate3([transferFrom(operator, …), …])` and
+ *                was pulled: Multicall3 lets the caller specify an
+ *                arbitrary `from`, so anyone could drain the operator's
+ *                Multicall3-allowance between the two txs. That has
+ *                happened in the wild against this tool.
  */
-export type OutputMode = "safe" | "multicall"
+export type OutputMode = "safe" | "disperse"
 
 /**
  * A single planned on-chain transaction. Built once, then consumed by either

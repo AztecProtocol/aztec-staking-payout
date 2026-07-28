@@ -167,6 +167,15 @@ export interface DiscoveryInput {
    *  it (e.g. inside a Multicall3 batch with balances/decimals), pass it here
    *  to skip an extra RPC call here. Otherwise discovery fetches it. */
   gseAddress?: Address
+  /** L1 blocks at which `IGSE.isRegistered` is checked. An attester counts
+   *  as active if registered at ANY of these blocks (union). Defaults to
+   *  `[toBlock]` — the historical "is this attester currently registered"
+   *  check the `status` command wants. For a settlement over
+   *  `[fromBlock, toBlock]`, callers should pass BOTH boundary blocks so
+   *  attesters that were active during the window but have since exited
+   *  (or entered the exit flow before `toBlock`) still get counted. Missing
+   *  this is the "exiting attester silently under-paid" class of bug. */
+  activityCheckBlocks?: bigint[]
   /** Optional retry counter — incremented per scheduled retry, so the caller
    *  can report primary vs retried RPC counts. */
   retryMeter?: { retries: number }
@@ -200,6 +209,14 @@ export interface DiscoveryStats {
   stakeEventsFound: number
   uniqueAttesters: number
   registeredOnRollup: number
+  /** Attesters that had a `StakedWithProvider` event for this provider but
+   *  weren't registered under the rollup or bonus instance at ANY of the
+   *  supplied `activityCheckBlocks`. Almost always harmless — they staked but
+   *  never activated (or exited entirely within the settlement window, which
+   *  is only possible with an unusually long settlement window given exit
+   *  delays). Surfaced so operators can spot the pathological "attester
+   *  registered + exited entirely between the two probes" case. */
+  phantomAttesters: Address[]
 }
 
 export interface DiscoveryResult {
@@ -263,6 +280,7 @@ export async function discoverActiveDelegators(
     stakeEventsFound: stakeEvents.length,
     uniqueAttesters: candidates.length,
     registeredOnRollup: 0,
+    phantomAttesters: [],
   }
   if (candidates.length === 0) return { delegators: [], stats }
 
@@ -289,53 +307,76 @@ export async function discoverActiveDelegators(
     })) as Address)
   const bonusInstance = BONUS_INSTANCE_ADDRESS
 
-  // Step 4: batch the isRegistered checks via Multicall3. Each attester gets
-  // two reads — under the rollup instance (moveWithLatestRollup=false) and
-  // under the bonus instance (=true) — and counts as active if EITHER is
-  // true. Chunked so we can show progress and bound multicall size.
+  // Step 4: check `isRegistered` for each candidate at every activity-check
+  // block, under both the rollup instance (moveWithLatestRollup=false) and
+  // the bonus instance (=true). An attester counts as active if any single
+  // one of those checks returns true — union across (block × instance).
+  //
+  // Why the multi-block union: a single-block check misses attesters that
+  // were fully registered *during* the settlement window but exited by the
+  // time the tool runs. Their proposals in the window are still owed to
+  // their delegator; filtering them out silently under-pays that delegator.
+  // Callers pass both boundary blocks (`fromBlock` and `toBlock`) so
+  // discovery covers the whole window.
+  //
+  // Chunked so multicall payloads stay reasonable and progress renders.
+  const activityCheckBlocks = input.activityCheckBlocks ?? [toBlock]
   const ATTESTERS_PER_BATCH = 250
   const activeByAttester = new Map<string, boolean>()
-  for (let i = 0; i < candidates.length; i += ATTESTERS_PER_BATCH) {
-    const batch = candidates.slice(i, i + ATTESTERS_PER_BATCH)
-    const contracts = batch.flatMap((c) => [
-      {
-        address: gseAddress,
-        abi: IGSE_IS_REGISTERED_ABI,
-        functionName: "isRegistered" as const,
-        args: [rollupAddress, c.attester] as const,
-      },
-      {
-        address: gseAddress,
-        abi: IGSE_IS_REGISTERED_ABI,
-        functionName: "isRegistered" as const,
-        args: [bonusInstance, c.attester] as const,
-      },
-    ])
-    const results = await client.multicall({
-      contracts,
-      allowFailure: true,
-      multicallAddress,
-      blockNumber: toBlock,
-    })
-    for (let j = 0; j < batch.length; j++) {
-      const onRollup = results[2 * j]
-      const onBonus = results[2 * j + 1]
-      const isActive =
-        (onRollup?.status === "success" && onRollup.result === true) ||
-        (onBonus?.status === "success" && onBonus.result === true)
-      activeByAttester.set(batch[j]!.attester.toLowerCase(), isActive)
+  for (const attester of candidates) {
+    activeByAttester.set(attester.attester.toLowerCase(), false)
+  }
+  for (const blockNumber of activityCheckBlocks) {
+    for (let i = 0; i < candidates.length; i += ATTESTERS_PER_BATCH) {
+      const batch = candidates.slice(i, i + ATTESTERS_PER_BATCH)
+      const contracts = batch.flatMap((c) => [
+        {
+          address: gseAddress,
+          abi: IGSE_IS_REGISTERED_ABI,
+          functionName: "isRegistered" as const,
+          args: [rollupAddress, c.attester] as const,
+        },
+        {
+          address: gseAddress,
+          abi: IGSE_IS_REGISTERED_ABI,
+          functionName: "isRegistered" as const,
+          args: [bonusInstance, c.attester] as const,
+        },
+      ])
+      const results = await client.multicall({
+        contracts,
+        allowFailure: true,
+        multicallAddress,
+        blockNumber,
+      })
+      for (let j = 0; j < batch.length; j++) {
+        const onRollup = results[2 * j]
+        const onBonus = results[2 * j + 1]
+        const isActiveHere =
+          (onRollup?.status === "success" && onRollup.result === true) ||
+          (onBonus?.status === "success" && onBonus.result === true)
+        if (isActiveHere) {
+          activeByAttester.set(batch[j]!.attester.toLowerCase(), true)
+        }
+      }
+      onProgress?.({
+        phase: "checking-attesters",
+        checked: Math.min(i + batch.length, candidates.length),
+        total: candidates.length,
+      })
     }
-    onProgress?.({
-      phase: "checking-attesters",
-      checked: Math.min(i + batch.length, candidates.length),
-      total: candidates.length,
-    })
   }
 
-  // Build output — filter by active + apply recipient mapping.
+  // Build output — filter by active + apply recipient mapping. Non-active
+  // candidates get recorded as phantoms in the stats for auditors and for
+  // the caller to surface (e.g. as a console warning).
   const active: DiscoveredDelegator[] = []
+  const phantomAttesters: Address[] = []
   for (const c of candidates) {
-    if (!activeByAttester.get(c.attester.toLowerCase())) continue
+    if (!activeByAttester.get(c.attester.toLowerCase())) {
+      phantomAttesters.push(c.attester)
+      continue
+    }
 
     const mapped = splitRecipients.get(c.splitAddress.toLowerCase())
     const delegator = mapped ?? c.stakerImplementation
@@ -357,6 +398,7 @@ export async function discoverActiveDelegators(
     a.stakedAtBlock === b.stakedAtBlock ? 0 : a.stakedAtBlock < b.stakedAtBlock ? -1 : 1,
   )
   stats.registeredOnRollup = active.length
+  stats.phantomAttesters = phantomAttesters
   return { delegators: active, stats }
 }
 

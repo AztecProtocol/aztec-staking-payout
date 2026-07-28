@@ -119,12 +119,12 @@ export interface SettleOptions {
    *  mode, which has no proposal count to multiply by. */
   simulateReward: bigint | null
   /** Output shape for the planned transactions. `null` means "auto":
-   *  `safe` for `--emit-calldata` (Safes can't use Multicall3 for ERC20
-   *  transfers — `msg.sender` inside aggregate3 is Multicall3, which holds
-   *  no tokens, so the inner transfer reverts), `multicall` for live
-   *  broadcast (a plain EOA gets fewer txs by approving once and aggregating
-   *  transferFrom calls). Cold-wallet EOAs reading the audit JSON can pick
-   *  either by passing this flag explicitly. */
+   *  `safe` for `--emit-calldata` (works for Safes / smart accounts / cold
+   *  EOAs signing individually) and `disperse` for live broadcast (a plain
+   *  EOA settles a whole period in two txs — approve Disperse, then
+   *  Disperse.disperseTokenSimple). Safe under a mempool race because
+   *  Disperse calls `transferFrom(msg.sender, …)` internally — only the
+   *  operator's own call can spend the operator's allowance. */
   outputMode: OutputMode | null
   /** When true, count every checkpoint proposed by the operator's attesters
    *  regardless of `header.coinbase`. Default (false) only counts checkpoints
@@ -155,13 +155,14 @@ export interface SettleResult {
  *   4. Count checkpoints each attester proposed within the epoch range.
  *   5. Proposal-weighted split + commission; or equal-split (override path).
  *   6. Build planned txs in the chosen output mode:
- *        - "safe":      N top-level `ERC20.transfer` calls (one per
+ *        - "safe":     N top-level `ERC20.transfer` calls (one per
  *          delegator). Safe wraps them in MultiSend; works for Safes,
  *          smart-account wallets, and cold-wallet EOAs signing one by one.
- *        - "multicall": optional `ERC20.approve(Multicall3, total)` + one
- *          `Multicall3.aggregate3([transferFrom, ...])`. Fewer txs but
- *          requires the wallet to be a plain EOA (Safes can't use this —
- *          inner transfer reverts with insufficient balance on Multicall3).
+ *        - "disperse": optional `ERC20.approve(Disperse, total)` + one
+ *          `Disperse.disperseTokenSimple(token, recipients, amounts)`.
+ *          Fewer txs, and safe under a mempool race because Disperse calls
+ *          `transferFrom(msg.sender, …)` internally — only the operator's
+ *          own call can spend the operator's allowance to Disperse.
  *   7. Branch on output mode (dry-run / emit-calldata / live).
  *   8. Write audit record.
  */
@@ -286,19 +287,26 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   const willSend = !dryRun && !emitSafeImport
 
   // Output-mode selection. Explicit > auto. Auto: `safe` whenever the user
-  // asked for an importable bundle (`--emit-calldata`); `multicall` for live
-  // broadcast (an EOA gets to settle a whole period in two txs). Safes
-  // *cannot* use `multicall` — Multicall3 becomes `msg.sender` on each inner
-  // ERC20.transfer and reverts with insufficient balance because Multicall3
-  // holds no tokens (verified on Tenderly: GS013 from Safe wrapping the
-  // inner revert). Picking `safe` for the emit-calldata path keeps the
-  // default safe-for-Safes.
-  const outputMode: OutputMode = opts.outputMode ?? (emitSafeImport ? "safe" : "multicall")
-  if (outputMode === "multicall" && emitSafeImport) {
+  // asked for an importable bundle (`--emit-calldata`); `disperse` for live
+  // broadcast (an EOA settles a whole period in two txs). Safes *cannot*
+  // use `disperse` in a meaningful way — their own MultiSend already
+  // provides atomic batching without any approve step.
+  //
+  // The earlier `multicall` mode (approve Multicall3 + aggregate3 of
+  // transferFroms) was removed after a live incident: Multicall3 lets any
+  // caller pick an arbitrary `from` for its inner calls, so an attacker
+  // observing the operator's approve tx could drain the allowance by calling
+  // Multicall3.aggregate3([transferFrom(operator, attacker, total)]) before
+  // the operator's own aggregate3 landed. Disperse.disperseTokenSimple
+  // instead calls `transferFrom(msg.sender, …)` internally, so the
+  // operator's allowance is only spendable by the operator.
+  const outputMode: OutputMode = opts.outputMode ?? (emitSafeImport ? "safe" : "disperse")
+  if (outputMode === "disperse" && emitSafeImport) {
     console.log(
-      `▸ ⚠ outputMode=multicall + --emit-calldata: the .safe.json will contain an ` +
-        `approve + Multicall3.aggregate3(transferFrom) batch. This is NOT executable ` +
-        `from a Safe — Safes need outputMode=safe (the default for --emit-calldata).`,
+      `▸ ⚠ outputMode=disperse + --emit-calldata: the .safe.json will contain an ` +
+        `approve + Disperse.disperseTokenSimple batch. This is unusual for Safes — ` +
+        `they have MultiSend built in via the Transaction Builder, which is what ` +
+        `outputMode=safe (the default for --emit-calldata) targets.`,
     )
   }
   console.log(`▸ Output mode: ${outputMode}`)
@@ -349,6 +357,11 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         logChunkSize: config.logChunkSize,
         stakeLogChunkSize: config.stakeLogChunkSize,
         gseAddress, // pre-fetched in the prelude multicall → skips a discovery RPC
+        // Union `isRegistered` across the settlement window boundaries.
+        // Passing only `toBlock` would filter out attesters that were
+        // registered during the window but have since exited — silently
+        // under-paying their delegators for the proposals they did make.
+        activityCheckBlocks: [fromBlock, toBlock],
         retryMeter: meter,
         onProgress: progress.onProgress,
       })
@@ -362,6 +375,19 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     )
     for (const d of discovered) {
       console.log(`    · attester ${d.attester} → delegator ${d.delegator} (${d.delegatorSource})`)
+    }
+    if (result.stats.phantomAttesters.length > 0) {
+      console.log(
+        `▸ ⚠ ${result.stats.phantomAttesters.length} attester(s) had StakedWithProvider ` +
+          `event(s) for providerId ${config.providerId} but weren't registered on the rollup ` +
+          `or bonus instance at fromBlock (${fromBlock}) or toBlock (${toBlock}). Most likely ` +
+          `they staked but never activated. If one of them proposed during the window (rare ` +
+          `edge case: registered + exited entirely within [fromBlock, toBlock]), their ` +
+          `checkpoints will be silently skipped by the counting loop. Attesters:`,
+      )
+      for (const a of result.stats.phantomAttesters) {
+        console.log(`    · ${a}`)
+      }
     }
   }
 
@@ -715,32 +741,32 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   }
 
   // ---- 5. Calldata ----
-  // For `multicall` mode we want the *current* allowance (not the snapshot
+  // For `disperse` mode we want the *current* allowance (not the snapshot
   // from `toBlock`) to decide whether to emit the approve tx: the operator
-  // may have approved Multicall3 between toBlock and now. Cheap re-read.
+  // may have approved Disperse between toBlock and now. Cheap re-read.
   // Skip when in `safe` mode — allowance is unused there.
   const currentAllowance: bigint =
-    outputMode === "multicall"
+    outputMode === "disperse"
       ? ((await publicClient.readContract({
           address: config.tokenAddress,
           abi: ERC20_ALLOWANCE_ABI,
           functionName: "allowance",
-          args: [config.distributionWalletAddress, config.multicallAddress],
+          args: [config.distributionWalletAddress, config.disperseAddress],
         })) as bigint)
       : 0n
-  if (outputMode === "multicall") {
+  if (outputMode === "disperse") {
     console.log(
-      `▸ Allowance(${config.distributionWalletAddress} → Multicall3) @head: ${currentAllowance}` +
+      `▸ Allowance(${config.distributionWalletAddress} → Disperse ${config.disperseAddress}) @head: ${currentAllowance}` +
         (currentAllowance >= totalForwarded
           ? `  (≥ totalForwarded ${totalForwarded} — approve tx will be skipped)`
           : `  (< totalForwarded ${totalForwarded} — approve tx will be included)`),
     )
   }
   const plannedTxs = buildPlannedTxs({
-    multicall3: config.multicallAddress,
     token: config.tokenAddress,
     entries,
     outputMode,
+    disperseAddress: config.disperseAddress,
     distributionWallet: config.distributionWalletAddress,
     currentAllowance,
   })

@@ -39,6 +39,20 @@ const configSchema = z
       getAddress("0xcA11bde05977b3631167028862bE2a173976CA11") as Address,
     ),
 
+    /** disperse.app's batch-transfer contract. Used by `--output-mode
+     *  disperse` (live EOA broadcast) to atomically fan out N ERC20 transfers
+     *  in one tx after a single `approve`. The contract calls
+     *  `token.transferFrom(msg.sender, recipient, amount)` internally, so
+     *  only the wallet that CALLED disperse can have its allowance consumed
+     *  — an attacker calling the same contract would spend their own
+     *  allowance, not yours. This is why disperse is safe where the earlier
+     *  `Multicall3.aggregate3([transferFrom(operator, …), …])` pattern was
+     *  not (Multicall3 lets the caller specify an arbitrary `from`).
+     *  Canonical mainnet deployment; override for other chains. */
+    disperseAddress: addressSchema.default(
+      getAddress("0xD152f549545093347A162Dce210e7293f1452150") as Address,
+    ),
+
     /** Max blocks per `eth_getLogs` call during discovery. Most public RPCs
      *  cap at 10k blocks; lower this if you see range errors. */
     logChunkSize: uintStringSchema.default("10000").transform((v) => BigInt(v)),
