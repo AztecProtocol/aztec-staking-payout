@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { buildPlannedTxs, serializePlannedTxs, writeSafeImport } from "./calldata.js"
 import type { DistributionEntry } from "./types.js"
 
-const MULTICALL3 = getAddress("0xcA11bde05977b3631167028862bE2a173976CA11") as Address
+const DISPERSE = getAddress("0xD152f549545093347A162Dce210e7293f1452150") as Address
 const TOKEN = getAddress("0x000000000000000000000000000000000000aaaa") as Address
 const WALLET = getAddress("0x000000000000000000000000000000000000bbbb") as Address
 
@@ -30,20 +30,6 @@ const TRANSFER_ABI = [
   },
 ] as const
 
-const TRANSFER_FROM_ABI = [
-  {
-    name: "transferFrom",
-    type: "function",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "from", type: "address" },
-      { name: "to", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-  },
-] as const
-
 const APPROVE_ABI = [
   {
     name: "approve",
@@ -57,39 +43,24 @@ const APPROVE_ABI = [
   },
 ] as const
 
-const AGGREGATE3_ABI = [
+const DISPERSE_TOKEN_SIMPLE_ABI = [
   {
-    name: "aggregate3",
+    name: "disperseTokenSimple",
     type: "function",
-    stateMutability: "payable",
+    stateMutability: "nonpayable",
     inputs: [
-      {
-        name: "calls",
-        type: "tuple[]",
-        components: [
-          { name: "target", type: "address" },
-          { name: "allowFailure", type: "bool" },
-          { name: "callData", type: "bytes" },
-        ],
-      },
+      { name: "token", type: "address" },
+      { name: "recipients", type: "address[]" },
+      { name: "values", type: "uint256[]" },
     ],
-    outputs: [
-      {
-        name: "returnData",
-        type: "tuple[]",
-        components: [
-          { name: "success", type: "bool" },
-          { name: "returnData", type: "bytes" },
-        ],
-      },
-    ],
+    outputs: [],
   },
 ] as const
 
 describe("buildPlannedTxs — empty input", () => {
   it("emits an empty list when there are no entries (safe mode)", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: [],
       outputMode: "safe",
@@ -101,7 +72,7 @@ describe("buildPlannedTxs — empty input", () => {
 
   it("emits an empty list when there are no entries (multicall mode)", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: [],
       outputMode: "multicall",
@@ -115,7 +86,7 @@ describe("buildPlannedTxs — empty input", () => {
 describe("buildPlannedTxs — safe mode", () => {
   it("emits one top-level ERC20.transfer per delegator (msg.sender stays the Safe)", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
       outputMode: "safe",
@@ -132,7 +103,7 @@ describe("buildPlannedTxs — safe mode", () => {
 
   it("encoded calldata for each entry decodes to the matching transfer(to, amount)", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
       outputMode: "safe",
@@ -149,7 +120,7 @@ describe("buildPlannedTxs — safe mode", () => {
 
   it("per-tx args carry the delegator + amount breakdown for audit", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
       outputMode: "safe",
@@ -165,92 +136,78 @@ describe("buildPlannedTxs — safe mode", () => {
   })
 })
 
-describe("buildPlannedTxs — multicall mode", () => {
-  it("emits approve + aggregate3 of transferFrom when allowance is insufficient", () => {
+describe("buildPlannedTxs — disperse mode", () => {
+  it("emits approve + disperseTokenSimple when allowance is insufficient", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
-      outputMode: "multicall",
+      outputMode: "disperse",
       distributionWallet: WALLET,
       currentAllowance: 0n,
     })
     expect(txs).toHaveLength(2)
     expect(txs[0]!.function).toBe("approve")
     expect(txs[0]!.to).toBe(TOKEN)
-    expect(txs[1]!.function).toBe("aggregate3")
-    expect(txs[1]!.to).toBe(MULTICALL3)
+    expect(txs[1]!.function).toBe("disperseTokenSimple")
+    expect(txs[1]!.to).toBe(DISPERSE)
   })
 
-  it("approve targets Multicall3 with the exact totalForwarded amount", () => {
+  it("approve targets Disperse with the exact totalForwarded amount", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
-      outputMode: "multicall",
+      outputMode: "disperse",
       distributionWallet: WALLET,
       currentAllowance: 0n,
     })
     const approve = decodeFunctionData({ abi: APPROVE_ABI, data: txs[0]!.data })
-    expect(approve.args[0]).toBe(MULTICALL3)
+    expect(approve.args[0]).toBe(DISPERSE)
     // totalForwarded = 950 + 475 = 1425
     expect(approve.args[1]).toBe(1425n)
   })
 
   it("skips approve when current allowance is already sufficient", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
-      outputMode: "multicall",
+      outputMode: "disperse",
       distributionWallet: WALLET,
       // allowance > total (1425) → no approve needed
       currentAllowance: 10_000n,
     })
     expect(txs).toHaveLength(1)
-    expect(txs[0]!.function).toBe("aggregate3")
+    expect(txs[0]!.function).toBe("disperseTokenSimple")
   })
 
-  it("inner calls are transferFrom(distributionWallet, delegator, amount) — never plain transfer", () => {
+  it("disperseTokenSimple encodes the token, recipient list, and amount list — no `from` argument", () => {
+    // The `from` for each internal transferFrom is `msg.sender` inside
+    // Disperse, chosen by the transaction sender at broadcast time. There
+    // is no `from` arg in the calldata — that's what makes this shape safe
+    // against a Multicall3-style drain (an attacker calling Disperse from
+    // their own wallet would spend their own allowance, not the operator's).
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
-      outputMode: "multicall",
+      outputMode: "disperse",
       distributionWallet: WALLET,
       currentAllowance: 0n,
     })
-    const agg = decodeFunctionData({ abi: AGGREGATE3_ABI, data: txs[1]!.data })
-    const calls = agg.args[0] as readonly {
-      target: Address
-      allowFailure: boolean
-      callData: `0x${string}`
-    }[]
-    expect(calls).toHaveLength(2)
-    for (const c of calls) {
-      expect(c.target.toLowerCase()).toBe(TOKEN.toLowerCase())
-      expect(c.allowFailure).toBe(false)
-    }
-    // Decode each inner call. transferFrom(from, to, amount) — `from` MUST be
-    // the distribution wallet (this is the whole point of the multicall mode
-    // fix: Multicall3 is msg.sender on the inner call, and only transferFrom
-    // pulls from the operator's wallet under the prior approve).
-    const inner0 = decodeFunctionData({ abi: TRANSFER_FROM_ABI, data: calls[0]!.callData })
-    expect(inner0.args[0]).toBe(WALLET)
-    expect(inner0.args[1]).toBe(addr("d1"))
-    expect(inner0.args[2]).toBe(950n)
-    const inner1 = decodeFunctionData({ abi: TRANSFER_FROM_ABI, data: calls[1]!.callData })
-    expect(inner1.args[0]).toBe(WALLET)
-    expect(inner1.args[1]).toBe(addr("d2"))
-    expect(inner1.args[2]).toBe(475n)
+    const decoded = decodeFunctionData({ abi: DISPERSE_TOKEN_SIMPLE_ABI, data: txs[1]!.data })
+    expect(decoded.args[0]).toBe(TOKEN)
+    expect(decoded.args[1]).toEqual([addr("d1"), addr("d2")])
+    expect(decoded.args[2]).toEqual([950n, 475n])
   })
 
-  it("aggregate3 args carry the per-delegator breakdown for audit (with from)", () => {
+  it("disperseTokenSimple args carry the per-delegator breakdown for audit (with from)", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
-      outputMode: "multicall",
+      outputMode: "disperse",
       distributionWallet: WALLET,
       currentAllowance: 0n,
     })
@@ -271,7 +228,7 @@ describe("buildPlannedTxs — multicall mode", () => {
 describe("serializePlannedTxs", () => {
   it("turns bigints into decimal strings", () => {
     const txs = buildPlannedTxs({
-      multicall3: MULTICALL3,
+      disperseAddress: DISPERSE,
       token: TOKEN,
       entries: sampleEntries,
       outputMode: "safe",
@@ -289,7 +246,7 @@ describe("writeSafeImport", () => {
     const dir = mkdtempSync(join(tmpdir(), "calldata-test-"))
     try {
       const txs = buildPlannedTxs({
-        multicall3: MULTICALL3,
+        disperseAddress: DISPERSE,
         token: TOKEN,
         entries: sampleEntries,
         outputMode: "safe",
@@ -333,7 +290,7 @@ describe("writeSafeImport", () => {
     const dir = mkdtempSync(join(tmpdir(), "calldata-test-"))
     try {
       const txs = buildPlannedTxs({
-        multicall3: MULTICALL3,
+        disperseAddress: DISPERSE,
         token: TOKEN,
         entries: sampleEntries,
         outputMode: "safe",

@@ -3,33 +3,33 @@ import { dirname, resolve } from "node:path"
 import { encodeFunctionData, type Address } from "viem"
 import type { DistributionEntry, OutputMode, PlannedTx } from "./types.js"
 
-/** Multicall3 ABI — only the function we need. */
-const MULTICALL3_ABI = [
+/**
+ * disperse.app contract, function `disperseTokenSimple`. The contract does:
+ *
+ *   for (uint i = 0; i < recipients.length; i++)
+ *     require(token.transferFrom(msg.sender, recipients[i], values[i]))
+ *
+ * ...so only the caller's own allowance-to-Disperse can be spent, no matter
+ * who calls the contract. This is what makes the `disperse` mode safe under a
+ * mempool race where an attacker also invokes Disperse against a stale
+ * allowance: they can only drain their own approvals, not the operator's.
+ *
+ * Contrast with Multicall3: `aggregate3([token.transferFrom(operator, …)])`
+ * lets the caller pick an arbitrary `from`, so any attacker who sees the
+ * operator's approve-Multicall3 tx can pull the allowance to themselves.
+ * That mode was removed after a live incident.
+ */
+const DISPERSE_ABI = [
   {
-    name: "aggregate3",
+    name: "disperseTokenSimple",
     type: "function",
-    stateMutability: "payable",
+    stateMutability: "nonpayable",
     inputs: [
-      {
-        name: "calls",
-        type: "tuple[]",
-        components: [
-          { name: "target", type: "address" },
-          { name: "allowFailure", type: "bool" },
-          { name: "callData", type: "bytes" },
-        ],
-      },
+      { name: "token", type: "address" },
+      { name: "recipients", type: "address[]" },
+      { name: "values", type: "uint256[]" },
     ],
-    outputs: [
-      {
-        name: "returnData",
-        type: "tuple[]",
-        components: [
-          { name: "success", type: "bool" },
-          { name: "returnData", type: "bytes" },
-        ],
-      },
-    ],
+    outputs: [],
   },
 ] as const
 
@@ -39,20 +39,6 @@ const ERC20_TRANSFER_ABI = [
     type: "function",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "to", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-  },
-] as const
-
-const ERC20_TRANSFER_FROM_ABI = [
-  {
-    name: "transferFrom",
-    type: "function",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "from", type: "address" },
       { name: "to", type: "address" },
       { name: "amount", type: "uint256" },
     ],
@@ -74,16 +60,20 @@ const ERC20_APPROVE_ABI = [
 ] as const
 
 interface BuildPlannedTxsInput {
-  multicall3: Address
   token: Address
   entries: DistributionEntry[]
   outputMode: OutputMode
-  /** The wallet holding the tokens. In `multicall` mode this is the `from`
-   *  argument to `transferFrom`. Ignored in `safe` mode. */
+  /** disperse.app-compatible batch contract. Used in `disperse` mode as the
+   *  target for both the `approve` and the `disperseTokenSimple` call.
+   *  Ignored in `safe` mode. */
+  disperseAddress: Address
+  /** The wallet holding the tokens. Recorded on the aggregate call's args
+   *  block for audit legibility (the actual tx signer is `msg.sender`, which
+   *  is chosen by whoever broadcasts). Ignored in `safe` mode. */
   distributionWallet: Address
-  /** Current ERC20 allowance the distribution wallet has granted Multicall3.
-   *  In `multicall` mode the approve tx is omitted when `>= total`. Ignored
-   *  in `safe` mode. */
+  /** Current ERC20 allowance the distribution wallet has granted the
+   *  disperse contract. In `disperse` mode the approve tx is omitted when
+   *  `>= total`. Ignored in `safe` mode. */
   currentAllowance: bigint
 }
 
@@ -92,17 +82,18 @@ interface BuildPlannedTxsInput {
  *
  * Shape depends on `outputMode`:
  *
- *   - "safe":      N planned txs, each `ERC20.transfer(delegator, amount)`
- *                  targeting the token directly. The Safe wraps them in
- *                  MultiSend at submission, so `msg.sender == Safe` on every
- *                  inner transfer and tokens flow from the Safe.
+ *   - "safe":     N planned txs, each `ERC20.transfer(delegator, amount)`
+ *                 targeting the token directly. The Safe wraps them in
+ *                 MultiSend at submission, so `msg.sender == Safe` on every
+ *                 inner transfer and tokens flow from the Safe.
  *
- *   - "multicall": 1 or 2 planned txs targeting first the token (optional
- *                  `approve(Multicall3, total)`) and then Multicall3
- *                  (`aggregate3([transferFrom(wallet, delegator, amount),
- *                  ...])`). The approve is skipped when `currentAllowance >=
- *                  total`. The aggregate3 step is atomic: any inner failure
- *                  reverts the whole batch.
+ *   - "disperse": 1 or 2 planned txs. First (only if `currentAllowance <
+ *                 total`) an `ERC20.approve(disperseAddress, total)`. Then
+ *                 `disperseTokenSimple(token, recipients, amounts)` on the
+ *                 disperse contract. Disperse's internal
+ *                 `transferFrom(msg.sender, recipient, amount)` means only
+ *                 the operator's allowance can be consumed *by the
+ *                 operator's own call* — safe under a mempool race.
  *
  * Amounts are already rate-adjusted at build time (see `buildDistribution` /
  * `buildWeightedDistribution` in attribution.ts).
@@ -115,7 +106,7 @@ export function buildPlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
   if (entries.length === 0) return []
   return outputMode === "safe"
     ? buildSafePlannedTxs(input)
-    : buildMulticallPlannedTxs(input)
+    : buildDispersePlannedTxs(input)
 }
 
 function buildSafePlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
@@ -139,50 +130,44 @@ function buildSafePlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
   }))
 }
 
-function buildMulticallPlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
-  const { multicall3, token, entries, distributionWallet, currentAllowance } = input
+function buildDispersePlannedTxs(input: BuildPlannedTxsInput): PlannedTx[] {
+  const { token, entries, disperseAddress, distributionWallet, currentAllowance } = input
   const total = entries.reduce((acc, e) => acc + e.amount, 0n)
   const planned: PlannedTx[] = []
 
   if (currentAllowance < total) {
     planned.push({
-      label: `ERC20.approve(Multicall3, ${total})`,
+      label: `ERC20.approve(Disperse, ${total})`,
       to: token,
       value: 0n,
       data: encodeFunctionData({
         abi: ERC20_APPROVE_ABI,
         functionName: "approve",
-        args: [multicall3, total],
+        args: [disperseAddress, total],
       }),
       function: "approve",
       args: {
         token,
-        spender: multicall3,
+        spender: disperseAddress,
         amount: total.toString(),
       },
     })
   }
 
-  const innerCalls = entries.map((e) => ({
-    target: token,
-    allowFailure: false,
-    callData: encodeFunctionData({
-      abi: ERC20_TRANSFER_FROM_ABI,
-      functionName: "transferFrom",
-      args: [distributionWallet, e.delegator, e.amount],
-    }),
-  }))
-
   planned.push({
-    label: `Multicall3.aggregate3(${entries.length} transferFrom calls)`,
-    to: multicall3,
+    label: `Disperse.disperseTokenSimple(${entries.length} transfers)`,
+    to: disperseAddress,
     value: 0n,
     data: encodeFunctionData({
-      abi: MULTICALL3_ABI,
-      functionName: "aggregate3",
-      args: [innerCalls],
+      abi: DISPERSE_ABI,
+      functionName: "disperseTokenSimple",
+      args: [
+        token,
+        entries.map((e) => e.delegator),
+        entries.map((e) => e.amount),
+      ],
     }),
-    function: "aggregate3",
+    function: "disperseTokenSimple",
     args: {
       from: distributionWallet,
       token,
