@@ -388,6 +388,26 @@ const run = (built: Built[]) =>
   })
 
 describe("countProposalsByProposer", () => {
+  it("rejects ambiguous proposal batches rather than assigning the first signer's rewards", async () => {
+    const first = await buildCheckpoint(KEY_A, 1n, 50n)
+    const second = await buildCheckpoint(KEY_B, 2n, 50n)
+    first.calldata = encodeFunctionData({ abi: AGGREGATE3_ABI, functionName: "aggregate3", args: [[
+      { target: ROLLUP, allowFailure: true, callData: first.calldata },
+      { target: ROLLUP, allowFailure: true, callData: second.calldata },
+    ]] })
+    const out = await run([first])
+    expect(out.unresolvedCheckpoints).toBe(1)
+    expect(out.firstUnresolvedError).toMatch(/Ambiguous proposal batch/)
+    expect(out.attributed).toEqual([])
+  })
+
+  it("rejects multiple checkpoint events sharing a transaction", async () => {
+    const first = await buildCheckpoint(KEY_A, 1n, 50n)
+    const second = await buildCheckpoint(KEY_B, 2n, 50n)
+    second.txHash = first.txHash
+    await expect(run([first, second])).rejects.toThrow(/Multiple checkpoints/)
+  })
+
   it("recovers the proposer from each propose() tx and tallies per proposer", async () => {
     const built = [
       await buildCheckpoint(KEY_A, 1n, 50n),
@@ -410,7 +430,7 @@ describe("countProposalsByProposer", () => {
     // event order, with the recovered proposer and the L1 metadata that lets
     // an outside auditor re-fetch the propose() tx.
     expect(out.attributed).toHaveLength(4)
-    expect(out.attributed[0]).toEqual({
+    expect(out.attributed[0]).toMatchObject({
       checkpointNumber: 1n,
       txHash: built[0]!.txHash,
       blockNumber: 50n,

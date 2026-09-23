@@ -58,8 +58,8 @@ export type AttributionMode = "proposals" | "equal-split"
  */
 export interface DistributionEntry {
   delegator: Address
-  /** Pre-rate allocation (for audit): the delegator's slice of the delta
-   *  before commission — weighted by proposals, or equal across delegators. */
+  /** Actual checkpoint earnings before commission, or a hypothetical
+   *  allocation when running with --simulate-reward. */
   preRateShare: bigint
   /** Post-rate amount actually transferred. */
   amount: bigint
@@ -67,7 +67,7 @@ export interface DistributionEntry {
    *  proposed in the window (the weight that earned the share). Omitted in
    *  "equal-split" mode. */
   weight?: number
-  /** How many of the operator's active attesters map to this delegator and
+  /** How many of the operator's contributing attesters map to this delegator and
    *  were aggregated into this single transfer. */
   attesters?: number
 }
@@ -122,10 +122,10 @@ export interface SettlementPlan {
   /** Derived: `checkpointReward × sequencerBps / 10000`. */
   sequencerRewardPerCheckpoint: bigint
   /** Number of checkpoints this operator's attesters proposed in the epoch
-   *  window. The reward formula's only variable input. */
+   *  window, recorded alongside their variable fees. */
   checkpointsProposed: number
-  /** `checkpointsProposed × sequencerRewardPerCheckpoint`. The canonical
-   *  amount to distribute this period (commission applies on top of this). */
+  /** Fixed rewards plus net sequencer fees for counted checkpoints.
+   *  Commission is deducted from each beneficiary's accumulated earnings. */
   rewardEarned: bigint
   /** L1 gas the operator's sequencers spent on the propose() calls counted
    *  above. Recorded but not subtracted from the reward — operators bake

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import {
   createPublicClient,
   custom,
@@ -16,6 +16,7 @@ import {
   SPLIT_CREATED_EVENT,
   STAKED_WITH_PROVIDER_EVENT,
   discoverActiveDelegators,
+  delegatorAtProposal,
   findDeployBlock,
 } from "./discovery.js"
 
@@ -323,6 +324,45 @@ function makeClient(fixtures: StakeFixture[]) {
 }
 
 describe("discoverActiveDelegators", () => {
+  const fixture: StakeFixture = { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"),
+    split: addr("51"), blockNumber: 100n, active: false }
+  const inputFor = (client: ReturnType<typeof makeClient>) => ({ client, stakingRegistryAddress: STAKING_REGISTRY,
+    rollupAddress: ROLLUP, multicallAddress: MULTICALL3, providerId: 42n, fromBlock: 0n, toBlock: 1000n, logChunkSize: 10000n })
+
+  it("retains exited validators and uses the beneficiary at proposal time across a restake", async () => {
+    const fixtures = [fixture, { ...fixture, split: addr("52"), blockNumber: 200n, userRewardsRecipient: addr("e2") }]
+    const { delegators } = await discoverActiveDelegators({ ...inputFor(makeClient(fixtures)), includeInactive: true })
+    expect(delegators).toHaveLength(2)
+    expect(delegatorAtProposal(delegators, fixture.attester, 99n, 1)).toBeUndefined()
+    expect(delegatorAtProposal(delegators, fixture.attester, 150n, 1)?.delegator).toBe(addr("e1"))
+    expect(delegatorAtProposal(delegators, fixture.attester, 200n, 0)?.delegator).toBe(addr("e1"))
+    expect(delegatorAtProposal(delegators, fixture.attester, 200n, 2)?.delegator).toBe(addr("e2"))
+  })
+
+  it("retries a failed receipt and aborts instead of falling back to the caller", async () => {
+    const client = makeClient([fixture])
+    const spy = vi.spyOn(client, "getTransactionReceipt").mockRejectedValue(new Error("receipt unavailable"))
+    await expect(discoverActiveDelegators({ ...inputFor(client), includeInactive: true })).rejects.toThrow(/receipt unavailable/)
+    expect(spy).toHaveBeenCalledTimes(4)
+  })
+
+  it("retries failed registration results and refuses to interpret failure as an exit", async () => {
+    const client = makeClient([{ ...fixture, active: true }])
+    const spy = vi.spyOn(client, "multicall").mockResolvedValue([{ status: "failure", error: new Error("timeout") }] as never)
+    await expect(discoverActiveDelegators(inputFor(client))).rejects.toThrow(/Registration checks failed/)
+    expect(spy).toHaveBeenCalledTimes(4)
+  })
+
+  it("rejects a SplitCreated log emitted by an unrelated factory", async () => {
+    const client = makeClient([fixture])
+    const original = client.getTransactionReceipt.bind(client)
+    vi.spyOn(client, "getTransactionReceipt").mockImplementation(async (args) => {
+      const receipt = await original(args)
+      return { ...receipt, logs: receipt.logs.map((log) => ({ ...log, address: addr("bad") })) }
+    })
+    await expect(discoverActiveDelegators({ ...inputFor(client), includeInactive: true })).rejects.toThrow(/Unresolved rewards recipient/)
+  })
+
   it("uses recipients[1] from SplitCreated as the delegator (preferred path)", async () => {
     const fixtures: StakeFixture[] = [
       {
@@ -351,7 +391,7 @@ describe("discoverActiveDelegators", () => {
     expect(out[0]?.staker).toBe(addr("d1"))
   })
 
-  it("falls back to msg.sender (staker) when no SplitCreated event found", async () => {
+  it("rejects an unresolved split instead of paying the staking caller", async () => {
     const fixtures: StakeFixture[] = [
       {
         attester: addr("a1"),
@@ -363,7 +403,7 @@ describe("discoverActiveDelegators", () => {
       },
     ]
     const client = makeClient(fixtures)
-    const { delegators: out } = await discoverActiveDelegators({
+    await expect(discoverActiveDelegators({
       client,
       stakingRegistryAddress: STAKING_REGISTRY,
       rollupAddress: ROLLUP,
@@ -372,14 +412,10 @@ describe("discoverActiveDelegators", () => {
       fromBlock: 0n,
       toBlock: 1000n,
       logChunkSize: 10000n,
-    })
-    expect(out).toHaveLength(1)
-    expect(out[0]?.delegator).toBe(addr("d1"))
-    expect(out[0]?.delegatorSource).toBe("msg.sender")
-    expect(out[0]?.staker).toBe(addr("d1"))
+    })).rejects.toThrow(/Unresolved rewards recipient/)
   })
 
-  it("handles mixed cases: some with split-recipient, some with fallback", async () => {
+  it("rejects the entire discovery when one beneficiary is unresolved", async () => {
     const fixtures: StakeFixture[] = [
       {
         attester: addr("a1"),
@@ -399,7 +435,7 @@ describe("discoverActiveDelegators", () => {
       },
     ]
     const client = makeClient(fixtures)
-    const { delegators: out } = await discoverActiveDelegators({
+    await expect(discoverActiveDelegators({
       client,
       stakingRegistryAddress: STAKING_REGISTRY,
       rollupAddress: ROLLUP,
@@ -408,12 +444,7 @@ describe("discoverActiveDelegators", () => {
       fromBlock: 0n,
       toBlock: 1000n,
       logChunkSize: 10000n,
-    })
-    expect(out).toHaveLength(2)
-    expect(out[0]?.delegator).toBe(addr("e1"))
-    expect(out[0]?.delegatorSource).toBe("split-recipient")
-    expect(out[1]?.delegator).toBe(addr("d2"))
-    expect(out[1]?.delegatorSource).toBe("msg.sender")
+    })).rejects.toThrow(/Unresolved rewards recipient/)
   })
 
   it("filters out attesters not currently registered in GSE", async () => {

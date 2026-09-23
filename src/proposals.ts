@@ -183,8 +183,8 @@ const AGGREGATE_SELECTOR = toFunctionSelector(AGGREGATE_ABI[0]).toLowerCase()
  * Extract the `propose()` calldata from a transaction's input — whether the
  * sequencer called `propose()` directly or wrapped it in a Multicall3
  * `aggregate3`/`aggregate` batch. Matches any known propose variant (v4 or
- * v5 selector). Prefers an inner call targeting the rollup, but falls back
- * to any inner call bearing a `propose()` selector.
+ * v5 selector). Requires exactly one matching call to the configured rollup;
+ * ambiguous batches cannot safely associate an event with its beneficiary.
  */
 function extractProposeCalldata(input: Hex, rollupAddress: Address): Hex {
   const sel = input.slice(0, 10).toLowerCase()
@@ -199,10 +199,9 @@ function extractProposeCalldata(input: Hex, rollupAddress: Address): Hex {
       }[])
     : []
   const isPropose = (d: Hex) => PROPOSE_ABI_BY_SELECTOR.has(d.slice(0, 10).toLowerCase())
-  const inner =
-    calls.find((c) => isPropose(c.callData) && c.target.toLowerCase() === rollupAddress.toLowerCase()) ??
-    calls.find((c) => isPropose(c.callData))
-  if (inner) return inner.callData
+  const matching = calls.filter((c) => isPropose(c.callData) && c.target.toLowerCase() === rollupAddress.toLowerCase())
+  if (matching.length > 1) throw new Error("Ambiguous proposal batch: multiple propose calls target the rollup")
+  if (matching.length === 1) return matching[0]!.callData
 
   // Name the unrecognised inner selectors, not just the outer wrapper — the
   // wrapper is usually Multicall3 and says nothing about the real mismatch
@@ -275,14 +274,14 @@ async function recoverProposerAndCoinbaseFromCalldata(
   input: Hex,
   rollupAddress: Address,
   chainId: number,
-): Promise<{ proposer: Address; coinbase: Address }> {
+): Promise<{ proposer: Address; coinbase: Address; accumulatedFees?: bigint }> {
   const proposeData = extractProposeCalldata(input, rollupAddress)
   // Selector is guaranteed known here — extractProposeCalldata only returns
   // calldata whose selector is in the map.
   const variant = PROPOSE_ABI_BY_SELECTOR.get(proposeData.slice(0, 10).toLowerCase())!
   const { args } = decodeFunctionData({ abi: variant.abi, data: proposeData })
   // _args.header.coinbase — element 0 of the args tuple, then `.header.coinbase`.
-  const argsTuple = args[0] as { header: { coinbase: Address } }
+  const argsTuple = args[0] as { header: { coinbase: Address; accumulatedFees?: bigint } }
   const coinbase = argsTuple.header.coinbase
   const attestations = args[1] as DecodedAttestations
   const signers = args[2] as readonly Address[]
@@ -323,7 +322,7 @@ async function recoverProposerAndCoinbaseFromCalldata(
       signature: { r: signature.r, s: signature.s, v: BigInt(signature.v) },
     })
   }
-  return { proposer, coinbase }
+  return { proposer, coinbase, accumulatedFees: argsTuple.header.accumulatedFees }
 }
 
 export type ProposalProgress =
@@ -361,6 +360,9 @@ export interface ProposalCountsInput {
  * recompute the split by looking up each checkpoint on chain).
  */
 export interface AttributedCheckpoint {
+  logIndex: number
+  /** v5 accumulated fees, before congestion burn and prover share. */
+  accumulatedFees?: bigint
   checkpointNumber: bigint
   txHash: Hex
   blockNumber: bigint
@@ -438,7 +440,7 @@ export async function countProposalsByProposer(
   //         L1 block per checkpoint so the audit can list each one. The block
   //         range is scanned generously to absorb proof-submission timing
   //         skew; the epoch gate is precise via the checkpoint-number filter. ----
-  type CheckpointEvent = { checkpointNumber: bigint; txHash: Hex; blockNumber: bigint }
+  type CheckpointEvent = { checkpointNumber: bigint; txHash: Hex; blockNumber: bigint; logIndex: number }
   const events: CheckpointEvent[] = []
   let outOfRange = 0
   let cursor = fromBlock
@@ -471,6 +473,7 @@ export async function countProposalsByProposer(
       events.push({
         checkpointNumber,
         txHash: log.transactionHash as Hex,
+        logIndex: log.logIndex ?? 0,
         blockNumber: log.blockNumber ?? 0n,
       })
     }
@@ -492,7 +495,8 @@ export async function countProposalsByProposer(
   const latestByCheckpoint = new Map<bigint, CheckpointEvent>()
   for (const ev of events) {
     const existing = latestByCheckpoint.get(ev.checkpointNumber)
-    if (!existing || ev.blockNumber > existing.blockNumber) {
+    if (!existing || ev.blockNumber > existing.blockNumber ||
+        (ev.blockNumber === existing.blockNumber && ev.logIndex > existing.logIndex)) {
       latestByCheckpoint.set(ev.checkpointNumber, ev)
     }
   }
@@ -517,10 +521,13 @@ export async function countProposalsByProposer(
   //         `sequencerRewards[…]` on, so the caller can gate "this counted
   //         toward our payout" on it. ----
   const uniqueTxs = [...new Set(dedupedEvents.map((e) => e.txHash))]
+  if (uniqueTxs.length !== dedupedEvents.length) {
+    throw new Error("Multiple checkpoints in one proposal transaction; cannot securely match calldata to checkpoint events")
+  }
   // One eth_chainId up front — the v5 digest is EIP-712 and binds the chain id
   // (and the rollup address, which we already have) into the signed payload.
   const chainId = await withRetry(() => client.getChainId(), undefined, undefined, retryMeter)
-  const decodedByTx = new Map<Hex, { proposer: Address; coinbase: Address }>()
+  const decodedByTx = new Map<Hex, { proposer: Address; coinbase: Address; accumulatedFees?: bigint }>()
   const recordUnresolved = (msg: string) => {
     if (counts.firstUnresolvedError === undefined) counts.firstUnresolvedError = msg
   }
@@ -541,12 +548,12 @@ export async function countProposalsByProposer(
       return
     }
     try {
-      const { proposer, coinbase } = await recoverProposerAndCoinbaseFromCalldata(
+      const { proposer, coinbase, accumulatedFees } = await recoverProposerAndCoinbaseFromCalldata(
         calldata,
         rollupAddress,
         chainId,
       )
-      decodedByTx.set(txHash, { proposer: getAddress(proposer), coinbase: getAddress(coinbase) })
+      decodedByTx.set(txHash, { proposer: getAddress(proposer), coinbase: getAddress(coinbase), accumulatedFees })
     } catch (e) {
       recordUnresolved(`tx ${txHash}: could not decode propose()/recover proposer: ${(e as Error).message}`)
     }
@@ -571,6 +578,8 @@ export async function countProposalsByProposer(
       checkpointNumber: ev.checkpointNumber,
       txHash: ev.txHash,
       blockNumber: ev.blockNumber,
+      logIndex: ev.logIndex,
+      accumulatedFees: decoded.accumulatedFees,
       proposer: decoded.proposer,
       coinbase: decoded.coinbase,
     })

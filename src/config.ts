@@ -81,13 +81,9 @@ const configSchema = z
     /** Skip transfers below this many token base units (after rate). */
     dustThreshold: uintStringSchema.default("0").transform((v) => BigInt(v)),
 
-    /** How to divide the period's reward delta among delegators:
-     *   - "proposals" (default): proportional to how many checkpoints each
-     *     delegator's attester actually proposed in the window — attribution
-     *     by real work. Requires the rollup's proposer views (an archival RPC).
-     *   - "equal-split": divide evenly across all active delegators (a pool;
-     *     ignores who did the work). Used automatically when delegatorsOverride
-     *     is set, since that path has no attester→proposer mapping. */
+    /** Attribution: "proposals" assigns each checkpoint's actual earnings
+     *  to its beneficiary. "equal-split" requires --simulate-reward and is
+     *  used with delegatorsOverride, which has no attester mapping. */
     attributionMode: z.enum(["proposals", "equal-split"]).default("proposals"),
 
     /** Where to write audit records. */
@@ -109,9 +105,7 @@ const configSchema = z
      *  have one number handy. */
     rollupDeployedAtBlock: uintStringSchema.transform((v) => BigInt(v)).optional(),
 
-    /** Escape hatch: bypass on-chain discovery and use this delegator list
-     *  instead. Useful for tests, edge cases, or operators whose split
-     *  setup the runner can't resolve. */
+    /** Simulation-only beneficiary override; requires --simulate-reward. */
     delegatorsOverride: z.array(addressSchema).optional(),
 
     // ─────────── Network-specific (look these up per chain) ───────────
@@ -143,7 +137,7 @@ const configSchema = z
      *  operator updates this value when they want to change the rate. */
     commissionBps: z.number().int().min(0).max(10000),
 
-    /** Archival RPC (historical `balanceOf` + event scans). */
+    /** Archival RPC (historical reward counters, fee headers and event scans). */
     rpcUrl: urlSchema,
   })
 

@@ -120,14 +120,12 @@ Options:
                               — the integrity gate against mid-window coinbase
                               switches (a counted checkpoint whose reward
                               routed elsewhere isn't payable from the
-                              distribution wallet). Use this for testnet runs,
-                              what-if simulation, or when you've manually
-                              pre-funded the distribution wallet to cover a
-                              prior-coinbase period.
+                              distribution wallet). Requires --simulate-reward;
+                              never emits a real payout with this override.
   --simulate-reward <amount>  (settle) Manual override of the reward amount.
                               By default the tool computes the reward via the
-                              protocol formula (oursProposed × checkpointReward
-                              × sequencerBps / 10000); use this flag to pin a
+                              checkpoint rewards plus net sequencer fees,
+                              reconciled to the rollup; use this flag to pin a
                               hypothetical amount in token base units. Forces
                               dry-run as a safety. Required for
                               attributionMode=equal-split (which has no
