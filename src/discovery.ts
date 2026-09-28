@@ -596,8 +596,8 @@ const ATTESTERS_PER_DEPOSIT_QUERY = 100
  * For those keys only, read the GSE `Deposit` events up to `toBlock` and keep
  * the record whose staker is the deposit's `withdrawer`. If no deposit had
  * activated by `toBlock`, the attester cannot have proposed in the window and
- * no record is kept. If several records share the withdrawer, refuse — there
- * is no on-chain way to pick the split.
+ * no record is kept. If several records share the withdrawer, keep the
+ * earliest: the rollup's entry queue is FIFO, so it is the one that activated.
  *
  * Keys with a single record pass through untouched and cost no RPC calls.
  */
@@ -663,15 +663,11 @@ async function resolveDuplicateKeys(
   for (const list of duplicated) {
     const attester = list[0]!.attester
     const withdrawers = withdrawersByAttester.get(attester.toLowerCase()) ?? new Set<string>()
-    const matches = list.filter((r) => withdrawers.has(r.stakerImplementation.toLowerCase()))
-    if (matches.length > 1) {
-      throw new Error(
-        `Attester ${attester}: ${matches.length} stake records match the GSE deposit withdrawer ` +
-          `(${[...withdrawers].join(", ")}), so the active split cannot be identified. ` +
-          `Stake txs: ${matches.map((r) => r.txHash).join(", ")}.`,
-      )
-    }
-    const selected = matches[0]
+    // `list` is in chain order. When several records share the withdrawer
+    // (the same staker staked the key more than once), the earliest one is
+    // the deposit that activated: the rollup's entry queue is first in, first
+    // out, and the later deposits for the same attester fail as duplicates.
+    const selected = list.find((r) => withdrawers.has(r.stakerImplementation.toLowerCase()))
     for (const r of list) if (r !== selected) discarded.add(r)
     duplicateKeys.push({
       attester,

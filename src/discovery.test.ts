@@ -615,18 +615,23 @@ describe("discoverActiveDelegators", () => {
     ])
   })
 
-  it("throws when more than one record of a duplicated key matches the GSE deposit", async () => {
-    // Same staker behind both records: the GSE withdrawer cannot tell them
-    // apart, so refuse rather than guess which split to pay.
+  it("selects the earliest record when several records share the GSE deposit withdrawer", async () => {
+    // Same staker behind both records (the same vault staked twice on the
+    // key), so the withdrawer matches both. The rollup's entry queue is FIFO:
+    // the earlier deposit activated and the later one failed as a duplicate.
     const fixtures: StakeFixture[] = [
       { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"), split: addr("51"),
         blockNumber: 100n, active: true, gseDepositAtBlock: 600n },
       { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1b"), split: addr("51b"),
-        blockNumber: 500n, active: true },
+        blockNumber: 102n, active: true },
     ]
-    await expect(discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures)))).rejects.toThrow(
-      /0x[aA]1[0]{38}.*2 stake records match/,
-    )
+    const { delegators: out, stats } = await discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures)))
+    expect(out).toHaveLength(1)
+    expect(out[0]?.splitAddress).toBe(addr("51"))
+    expect(out[0]?.delegator).toBe(addr("e1"))
+    expect(stats.duplicateKeys).toEqual([
+      { attester: addr("a1"), selectedStaker: addr("d1"), discardedStakers: [addr("d1")] },
+    ])
   })
 
   it("does not scan GSE deposits when every key has a single stake record", async () => {
