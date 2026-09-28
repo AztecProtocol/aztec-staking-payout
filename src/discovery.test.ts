@@ -13,6 +13,7 @@ import {
 } from "viem"
 import {
   BONUS_INSTANCE_ADDRESS,
+  GSE_DEPOSIT_EVENT,
   SPLIT_CREATED_EVENT,
   STAKED_WITH_PROVIDER_EVENT,
   discoverActiveDelegators,
@@ -49,6 +50,12 @@ interface StakeFixture {
   /** If active: registered under the bonus instance (moveWithLatestRollup
    *  =true, the default/common case) vs the rollup instance (=false). */
   viaBonus?: boolean
+  /** Block of the GSE `Deposit` event for this stake — i.e. the block where
+   *  this stake's deposit left the rollup's entry queue and activated, with
+   *  `withdrawer = staker`. Unset = no GSE deposit (a queued deposit that
+   *  failed, or one not yet processed). Only consulted for attesters with
+   *  more than one stake record. */
+  gseDepositAtBlock?: bigint
 }
 
 const IS_REGISTERED_ABI = [
@@ -104,7 +111,7 @@ const ADDR_RESULT_ABI = (name: string) =>
     },
   ] as const
 
-function makeMockTransport(fixtures: StakeFixture[]) {
+function makeMockTransport(fixtures: StakeFixture[], calls?: { gseDepositLogScans: number }) {
   const getGSESelector = toFunctionSelector("function getGSE() view returns (address)").toLowerCase()
   const bonusSelector = toFunctionSelector(
     "function getBonusInstanceAddress() view returns (address)",
@@ -121,6 +128,7 @@ function makeMockTransport(fixtures: StakeFixture[]) {
 
   const stakeEventTopic0 = encodeEventTopics({ abi: [STAKED_WITH_PROVIDER_EVENT] })[0]
   const splitEventTopic0 = encodeEventTopics({ abi: [SPLIT_CREATED_EVENT] })[0]
+  const gseDepositTopic0 = encodeEventTopics({ abi: [GSE_DEPOSIT_EVENT] })[0]
 
   // Each stake fixture gets a deterministic tx hash derived from its (unique)
   // split address, so the receipt lookup can find it.
@@ -254,6 +262,40 @@ function makeMockTransport(fixtures: StakeFixture[]) {
               })
           }
 
+          if (addressLower === GSE.toLowerCase() && topic0 === gseDepositTopic0) {
+            if (calls) calls.gseDepositLogScans++
+            // topics[2] is the indexed attester filter: one topic or an OR-list.
+            const attesterFilter = filter.topics[2]
+            const wanted =
+              attesterFilter === null || attesterFilter === undefined
+                ? null
+                : (Array.isArray(attesterFilter) ? attesterFilter : [attesterFilter]).map((t) => t.toLowerCase())
+            return fixtures
+              .filter((f) => f.gseDepositAtBlock !== undefined)
+              .filter((f) => f.gseDepositAtBlock! >= from && f.gseDepositAtBlock! <= to)
+              .filter((f) => {
+                const attesterTopic = encodeEventTopics({
+                  abi: [GSE_DEPOSIT_EVENT],
+                  args: { attester: f.attester },
+                })[2] as Hex
+                return wanted === null || wanted.includes(attesterTopic.toLowerCase())
+              })
+              .map((f) => ({
+                address: GSE.toLowerCase(),
+                topics: encodeEventTopics({
+                  abi: [GSE_DEPOSIT_EVENT],
+                  args: { instance: BONUS_INSTANCE, attester: f.attester },
+                }),
+                data: encodeAbiParameters([{ name: "withdrawer", type: "address" }], [f.staker]),
+                blockNumber: `0x${f.gseDepositAtBlock!.toString(16)}`,
+                blockHash: `0x${"b".repeat(64)}`,
+                transactionHash: `0x${f.attester.slice(2).toLowerCase().padEnd(64, "d")}`,
+                transactionIndex: "0x0",
+                logIndex: "0x0",
+                removed: false,
+              }))
+          }
+
           return []
         }
         case "eth_getTransactionReceipt": {
@@ -318,8 +360,8 @@ function makeMockTransport(fixtures: StakeFixture[]) {
   }, { retryCount: 0 })
 }
 
-function makeClient(fixtures: StakeFixture[]) {
-  return createPublicClient({ transport: makeMockTransport(fixtures) })
+function makeClient(fixtures: StakeFixture[], calls?: { gseDepositLogScans: number }) {
+  return createPublicClient({ transport: makeMockTransport(fixtures, calls) })
 }
 
 describe("discoverActiveDelegators", () => {
@@ -509,39 +551,96 @@ describe("discoverActiveDelegators", () => {
     expect(out.map((d) => d.attester)).toEqual([earlyAtt, lateAtt])
   })
 
-  it("dedupes by attester across multiple stake events (latest wins)", async () => {
+  // A key can carry more than one StakedWithProvider record when the provider
+  // queued the same key twice: the registry hands it out once per copy, and
+  // every stake emits its own record and split. Only one deposit can activate
+  // in the GSE (an attester address registers once); the other fails at the
+  // rollup and is refunded. The record that counts is the one whose staker is
+  // the withdrawer of the GSE Deposit — regardless of record order.
+  const duplicateKeyInput = (client: ReturnType<typeof makeClient>) => ({
+    client,
+    stakingRegistryAddress: STAKING_REGISTRY,
+    rollupAddress: ROLLUP,
+    multicallAddress: MULTICALL3,
+    providerId: 42n,
+    fromBlock: 0n,
+    toBlock: 1000n,
+    logChunkSize: 10000n,
+  })
+
+  it("resolves a duplicated key to the stake whose deposit activated in the GSE, not the latest record", async () => {
     const fixtures: StakeFixture[] = [
-      {
-        attester: addr("a1"),
-        staker: addr("d1"),
-        userRewardsRecipient: addr("e1"),
-        split: addr("51"),
-        blockNumber: 100n,
-        active: true,
-      },
-      {
-        attester: addr("a1"),
-        staker: addr("d1b"),
-        userRewardsRecipient: addr("e1b"),
-        split: addr("51b"),
-        blockNumber: 500n,
-        active: true,
-      },
+      // First copy of the key: this deposit activated.
+      { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"), split: addr("51"),
+        blockNumber: 100n, active: true, gseDepositAtBlock: 600n },
+      // Second copy: queued later, deposit failed (no GSE Deposit).
+      { attester: addr("a1"), staker: addr("d1b"), userRewardsRecipient: addr("e1b"), split: addr("51b"),
+        blockNumber: 500n, active: true },
     ]
-    const client = makeClient(fixtures)
-    const { delegators: out } = await discoverActiveDelegators({
-      client,
-      stakingRegistryAddress: STAKING_REGISTRY,
-      rollupAddress: ROLLUP,
-      multicallAddress: MULTICALL3,
-      providerId: 42n,
-      fromBlock: 0n,
-      toBlock: 1000n,
-      logChunkSize: 10000n,
-    })
+    const { delegators: out, stats } = await discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures)))
+    expect(out).toHaveLength(1)
+    expect(out[0]?.delegator).toBe(addr("e1"))
+    expect(out[0]?.staker).toBe(addr("d1"))
+    expect(out[0]?.stakedAtBlock).toBe(100n)
+    expect(stats.duplicateKeys).toEqual([
+      { attester: addr("a1"), selectedStaker: addr("d1"), discardedStakers: [addr("d1b")] },
+    ])
+  })
+
+  it("selects the later record when that is the one whose deposit activated", async () => {
+    const fixtures: StakeFixture[] = [
+      { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"), split: addr("51"),
+        blockNumber: 100n, active: true },
+      { attester: addr("a1"), staker: addr("d1b"), userRewardsRecipient: addr("e1b"), split: addr("51b"),
+        blockNumber: 500n, active: true, gseDepositAtBlock: 700n },
+    ]
+    const { delegators: out } = await discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures)))
     expect(out).toHaveLength(1)
     expect(out[0]?.delegator).toBe(addr("e1b"))
-    expect(out[0]?.stakedAtBlock).toBe(500n)
+  })
+
+  it("excludes a duplicated key whose deposit had not activated by toBlock", async () => {
+    // Both copies still queued (or failed) as of toBlock: the attester cannot
+    // have proposed in the window, so no record may claim its checkpoints.
+    const fixtures: StakeFixture[] = [
+      { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"), split: addr("51"),
+        blockNumber: 100n, active: true, gseDepositAtBlock: 1500n },
+      { attester: addr("a1"), staker: addr("d1b"), userRewardsRecipient: addr("e1b"), split: addr("51b"),
+        blockNumber: 500n, active: true },
+    ]
+    const { delegators: out, stats } = await discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures)))
+    expect(out).toHaveLength(0)
+    expect(stats.duplicateKeys).toEqual([
+      { attester: addr("a1"), selectedStaker: null, discardedStakers: [addr("d1"), addr("d1b")] },
+    ])
+  })
+
+  it("throws when more than one record of a duplicated key matches the GSE deposit", async () => {
+    // Same staker behind both records: the GSE withdrawer cannot tell them
+    // apart, so refuse rather than guess which split to pay.
+    const fixtures: StakeFixture[] = [
+      { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"), split: addr("51"),
+        blockNumber: 100n, active: true, gseDepositAtBlock: 600n },
+      { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1b"), split: addr("51b"),
+        blockNumber: 500n, active: true },
+    ]
+    await expect(discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures)))).rejects.toThrow(
+      /0x[aA]1[0]{38}.*2 stake records match/,
+    )
+  })
+
+  it("does not scan GSE deposits when every key has a single stake record", async () => {
+    const fixtures: StakeFixture[] = [
+      { attester: addr("a1"), staker: addr("d1"), userRewardsRecipient: addr("e1"), split: addr("51"),
+        blockNumber: 100n, active: true },
+      { attester: addr("a2"), staker: addr("d2"), userRewardsRecipient: addr("e2"), split: addr("52"),
+        blockNumber: 200n, active: true },
+    ]
+    const calls = { gseDepositLogScans: 0 }
+    const { delegators: out, stats } = await discoverActiveDelegators(duplicateKeyInput(makeClient(fixtures, calls)))
+    expect(out).toHaveLength(2)
+    expect(calls.gseDepositLogScans).toBe(0)
+    expect(stats.duplicateKeys).toEqual([])
   })
 
   it("chunks the eth_getLogs scan to respect logChunkSize", async () => {

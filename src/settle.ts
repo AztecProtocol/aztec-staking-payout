@@ -389,6 +389,21 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         console.log(`    · ${a}`)
       }
     }
+    if (result.stats.duplicateKeys.length > 0) {
+      console.log(
+        `▸ ⚠ ${result.stats.duplicateKeys.length} attester key(s) have more than one StakedWithProvider ` +
+          `record for providerId ${config.providerId} — the same key was queued more than once, so ` +
+          `several stakes were given the same key and only one deposit activated in the GSE. ` +
+          `Each key is resolved to the stake whose staker is the GSE Deposit withdrawer; the other ` +
+          `records are ignored:`,
+      )
+      for (const k of result.stats.duplicateKeys) {
+        console.log(
+          `    · attester ${k.attester}: using staker ${k.selectedStaker ?? "(none — no GSE deposit by toBlock)"}` +
+            `, ignoring ${k.discardedStakers.join(", ")}`,
+        )
+      }
+    }
   }
 
   if (delegatorList.length === 0) {

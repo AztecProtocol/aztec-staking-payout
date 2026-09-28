@@ -86,6 +86,11 @@ The runner enumerates the operator's stakers automatically — no manual list to
    Yields: (attester, split, staker=msg.sender, txHash, block) per stake event
    (rollup scoping is done by the isRegistered check in step 4, not here)
 
+1b. Only for attesters with MORE than one stake event (see below):
+   eth_getLogs GSE → Deposit(instance, attester, withdrawer)
+   filtered by those attesters, up to toBlock
+   keep the stake whose staker == withdrawer; drop the others
+
 2. For each stake, fetch its transaction receipt and read the SplitCreated
    log emitted in the SAME tx (the StakingRegistry creates the split inside
    stake()). Decode splitParams.recipients[1].
@@ -105,6 +110,8 @@ The runner enumerates the operator's stakers automatically — no manual list to
 ```
 
 **The PullSplit recipient is preferred over msg.sender.** When the staker called `StakingRegistry.stake(..., _userRewardsRecipient, ...)` they may have passed a recipient address different from their own. The runner recovers this from the `SplitCreated` log emitted in the **same transaction** as each stake (the StakingRegistry calls the PullSplitFactory synchronously in `stake()`) — `splitParams.recipients[1]` is the user's chosen recipient (`recipients[0]` is the operator's `providerRewardsRecipient`). Reading it from the stake's own receipt means there's no separate event scan and no factory address to look up. If the SplitCreated log can't be matched (e.g. an unrecognised StakingRegistry version, or the receipt is unavailable), the runner falls back to `staker` (msg.sender) and tags the audit record with `delegatorSource: "msg.sender"`.
+
+**Keys with more than one stake record.** Normally each attester has exactly one `StakedWithProvider` event. It has several when the provider queued the same key more than once (for example, the same batch submitted twice): the registry hands each queued copy to a new stake, and each stake emits its own event and creates its own split. An attester address can register in the GSE only once, so only one of those deposits activates; the others fail at the rollup (`FailedDeposit`) and are refunded. The failed stakes' events and splits stay on-chain, and their order says nothing about which deposit activated — so neither "latest wins" nor "first wins" is safe. For these attesters only, the runner reads the GSE `Deposit` event and keeps the stake whose staker is the deposit's `withdrawer`. If no deposit had activated by `toBlock`, the attester cannot have proposed in the window and no stake is kept. If more than one stake matches, the run stops. Each resolution is printed (`settle` and `status`) and returned in `stats.duplicateKeys`. Attesters with a single stake cost no extra RPC calls.
 
 **Both deposit styles count.** An attester registers under the rollup instance (`moveWithLatestRollup = false`) or under the GSE bonus instance (`= true`); the runner checks both, so a delegator using either is discovered.
 
@@ -233,4 +240,4 @@ Signs + sends with `PRIVATE_KEY`. Signer must match `distributionWalletAddress` 
 npm test
 ```
 
-Covers attribution (proposal-weighted + equal split + dust + rounding), proposals (checkpoint scan → recover proposer from a genuinely-signed `propose()` calldata + unresolved handling), calldata (Multicall3 round-trip + Safe export), and discovery (event scan + same-tx split resolution + GSE filter + dedupe + log-chunking). All via mocked RPC — no network or chain access required.
+Covers attribution (proposal-weighted + equal split + dust + rounding), proposals (checkpoint scan → recover proposer from a genuinely-signed `propose()` calldata + unresolved handling), calldata (Multicall3 round-trip + Safe export), and discovery (event scan + same-tx split resolution + GSE filter + duplicate-key resolution via the GSE Deposit withdrawer + log-chunking). All via mocked RPC — no network or chain access required.
