@@ -12,7 +12,13 @@ import type { RunnerConfig } from "./config.js"
 import { makePublicClient } from "./client.js"
 import { buildDistribution, buildWeightedDistribution, type WeightedDelegator } from "./attribution.js"
 import { buildPlannedTxs, serializePlannedTxs, writeSafeImport } from "./calldata.js"
-import { discoverActiveDelegators, findDeployBlock, type DiscoveredDelegator } from "./discovery.js"
+import {
+  describeDuplicateKey,
+  discoverActiveDelegators,
+  findDeployBlock,
+  type DiscoveredDelegator,
+  type DuplicateKeyResolution,
+} from "./discovery.js"
 import { countProposalsByProposer } from "./proposals.js"
 import { computeGasSpent } from "./gascost.js"
 import { resolveEpochRange, type EpochRange } from "./epochs.js"
@@ -323,6 +329,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
 
   // ---- 4. Discover delegators ----
   let discovered: DiscoveredDelegator[] = []
+  let duplicateKeys: DuplicateKeyResolution[] = []
   let delegatorList: Address[]
   if (config.delegatorsOverride && config.delegatorsOverride.length > 0) {
     delegatorList = [...config.delegatorsOverride]
@@ -389,19 +396,17 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         console.log(`    · ${a}`)
       }
     }
-    if (result.stats.duplicateKeys.length > 0) {
+    duplicateKeys = result.stats.duplicateKeys
+    if (duplicateKeys.length > 0) {
       console.log(
-        `▸ ⚠ ${result.stats.duplicateKeys.length} attester key(s) have more than one StakedWithProvider ` +
+        `▸ ⚠ ${duplicateKeys.length} attester key(s) have more than one StakedWithProvider ` +
           `record for providerId ${config.providerId} — the same key was queued more than once, so ` +
           `several stakes were given the same key and only one deposit activated in the GSE. ` +
-          `Each key is resolved to the stake whose staker is the GSE Deposit withdrawer; the other ` +
-          `records are ignored:`,
+          `Each key is resolved to the record whose queued withdrawer is the GSE Deposit withdrawer; ` +
+          `the other records are ignored (also recorded in the audit JSON as \`duplicateKeys\`):`,
       )
-      for (const k of result.stats.duplicateKeys) {
-        console.log(
-          `    · attester ${k.attester}: using staker ${k.selectedStaker ?? "(none — no GSE deposit by toBlock)"}` +
-            `, ignoring ${k.discardedStakers.join(", ")}`,
-        )
+      for (const k of duplicateKeys) {
+        console.log(`    · attester ${k.attester}: ${describeDuplicateKey(k)}`)
       }
     }
   }
@@ -959,6 +964,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         }
       : {}),
     txHashes,
+    ...(duplicateKeys.length > 0 ? { duplicateKeys } : {}),
     ...(manualOverride ? { manualOverride: true } : {}),
     ...(safeImportPathOut ? { safeImportPath: safeImportPathOut } : {}),
   }
