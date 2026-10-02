@@ -88,8 +88,9 @@ The runner enumerates the operator's stakers automatically — no manual list to
 
 1b. Only for attesters with MORE than one stake event (see below):
    eth_getLogs GSE → Deposit(instance, attester, withdrawer)
-   filtered by those attesters, up to toBlock
-   keep the stake whose staker == withdrawer; drop the others
+   filtered by those attesters, from the stake-scan start up to toBlock
+   keep the stake whose queued withdrawer (its ValidatorQueued log in the
+   stake tx) == the Deposit withdrawer; drop the others
 
 2. For each stake, fetch its transaction receipt and read the SplitCreated
    log emitted in the SAME tx (the StakingRegistry creates the split inside

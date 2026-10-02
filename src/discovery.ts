@@ -100,10 +100,11 @@ export const SPLIT_CREATED_EVENT = parseAbiItem(
  *
  *   event Deposit(address indexed instance, address indexed attester, address withdrawer);
  *
- * `withdrawer` is the `stakerImplementation` of the stake whose deposit
- * activated. An attester address can register in the GSE only once, so this
- * is how we tell the active stake apart when a key has several
- * `StakedWithProvider` records (see `resolveDuplicateKeys`).
+ * `withdrawer` is the withdrawal address of the stake whose deposit
+ * activated — the same address that stake's `ValidatorQueued` log carries. An
+ * attester address can register in the GSE only once, so this is how we tell
+ * the active stake apart when a key has several `StakedWithProvider` records
+ * (see `resolveDuplicateKeys`).
  */
 export const GSE_DEPOSIT_EVENT = parseAbiItem(
   "event Deposit(address indexed instance, address indexed attester, address withdrawer)",
@@ -633,14 +634,17 @@ const ATTESTERS_PER_DEPOSIT_QUERY = 100
  * out each queued copy to a new stake, and every stake emits its own record
  * and creates its own split. An attester address can register in the GSE only
  * once, so only one of those deposits activates; the others fail at the rollup
- * (`FailedDeposit`) and are refunded to their staker. Their records and splits
- * stay on-chain, and record order says nothing about which deposit won.
+ * (`FailedDeposit`) and are refunded to their withdrawer. Their records and
+ * splits stay on-chain, and record order says nothing about which deposit won.
  *
- * For those keys only, read the GSE `Deposit` events up to `toBlock` and keep
- * the record whose staker is the deposit's `withdrawer`. If no deposit had
+ * For those keys only, read the GSE `Deposit` events from `fromBlock` up to
+ * `toBlock` and keep the record whose queued withdrawer (from its
+ * `ValidatorQueued` log) is the deposit's `withdrawer`. If no deposit had
  * activated by `toBlock`, the attester cannot have proposed in the window and
- * no record is kept. If several records share the withdrawer, keep the
- * earliest: the rollup's entry queue is FIFO, so it is the one that activated.
+ * no record is kept. If a deposit exists but matches no record, the key was
+ * deposited outside the registry and no record is kept either. If several
+ * records share the withdrawer, keep the earliest: the rollup's entry queue is
+ * FIFO, so it is the one that activated.
  *
  * Keys with a single record pass through untouched and cost no RPC calls.
  */
