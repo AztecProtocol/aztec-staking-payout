@@ -2,7 +2,7 @@
 import { loadConfig, loadPrivateKey } from "./config.js"
 import { makePublicClient } from "./client.js"
 import { settle } from "./settle.js"
-import { discoverActiveDelegators, findDeployBlock, probeProviderIds } from "./discovery.js"
+import { describeDuplicateKey, discoverActiveDelegators, findDeployBlock, probeProviderIds } from "./discovery.js"
 import { createInlineProgress } from "./progress.js"
 import type { OutputMode } from "./types.js"
 
@@ -387,6 +387,14 @@ async function runStatus(parsed: ParsedArgs): Promise<number> {
         process.stdout.write(
           `Funnel:               ${stats.stakeEventsFound} stake event(s) → ${stats.uniqueAttesters} attester(s) → ${stats.registeredOnRollup} active on rollup\n`,
         )
+        if (stats.duplicateKeys.length > 0) {
+          process.stdout.write(
+            `Duplicate keys:       ${stats.duplicateKeys.length} key(s) with several stake records — resolved to the GSE Deposit withdrawer:\n`,
+          )
+          for (const k of stats.duplicateKeys) {
+            process.stdout.write(`  · attester ${k.attester}: ${describeDuplicateKey(k)}\n`)
+          }
+        }
         process.stdout.write(`Active delegators (${delegators.length}):\n`)
         for (const d of delegators) {
           process.stdout.write(`  · attester ${d.attester} → ${d.delegator} (${d.delegatorSource})\n`)

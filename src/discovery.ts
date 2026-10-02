@@ -95,6 +95,37 @@ export const SPLIT_CREATED_EVENT = parseAbiItem(
 )
 
 /**
+ * `Deposit` event emitted by the GSE when a queued deposit leaves the rollup's
+ * entry queue and the attester becomes registered.
+ *
+ *   event Deposit(address indexed instance, address indexed attester, address withdrawer);
+ *
+ * `withdrawer` is the withdrawal address of the stake whose deposit
+ * activated — the same address that stake's `ValidatorQueued` log carries. An
+ * attester address can register in the GSE only once, so this is how we tell
+ * the active stake apart when a key has several `StakedWithProvider` records
+ * (see `resolveDuplicateKeys`).
+ */
+export const GSE_DEPOSIT_EVENT = parseAbiItem(
+  "event Deposit(address indexed instance, address indexed attester, address withdrawer)",
+)
+
+/**
+ * `ValidatorQueued` event emitted by the rollup's `deposit()` — inside the
+ * same transaction as the `StakedWithProvider` record, by the rollup named in
+ * that record.
+ *
+ *   event ValidatorQueued(address indexed attester, address indexed withdrawer);
+ *
+ * `withdrawer` is the `_withdrawalAddress` the staker passed to `stake()`. It
+ * is what the GSE `Deposit` carries when the deposit activates, and it need
+ * not equal the record's `stakerImplementation` (msg.sender).
+ */
+export const VALIDATOR_QUEUED_EVENT = parseAbiItem(
+  "event ValidatorQueued(address indexed attester, address indexed withdrawer)",
+)
+
+/**
  * IStaking.getGSE() — derive GSE from the rollup so the operator doesn't
  * need to configure it separately.
  */
@@ -217,6 +248,37 @@ export interface DiscoveryStats {
    *  delays). Surfaced so operators can spot the pathological "attester
    *  registered + exited entirely between the two probes" case. */
   phantomAttesters: Address[]
+  /** Keys with more than one `StakedWithProvider` record, and which record
+   *  was kept. Happens when the provider queued the same key twice: each copy
+   *  was handed to a different stake, but only one deposit can activate in the
+   *  GSE; the other fails at the rollup and is refunded. `selectedStaker` is
+   *  the staker of the record whose queued withdrawer equals the GSE
+   *  `Deposit` withdrawer (null if none does); every other record's staker is
+   *  in `discardedStakers`. */
+  duplicateKeys: DuplicateKeyResolution[]
+}
+
+export interface DuplicateKeyResolution {
+  attester: Address
+  /** Withdrawer of the key's GSE `Deposit` up to `toBlock`, or null if no
+   *  deposit had activated by then. When non-null and `selectedStaker` is
+   *  null, the active deposit was not made by any of the provider's records
+   *  (e.g. the key was deposited directly), so no delegator owns it. */
+  gseWithdrawer: Address | null
+  selectedStaker: Address | null
+  discardedStakers: Address[]
+}
+
+/** One-line, human-readable outcome of a duplicate-key resolution — shared
+ *  by `settle` and `status` so both print the same reason. */
+export function describeDuplicateKey(k: DuplicateKeyResolution): string {
+  const ignored = `ignoring ${k.discardedStakers.join(", ")}`
+  if (k.selectedStaker) return `using staker ${k.selectedStaker} (GSE deposit withdrawer ${k.gseWithdrawer}), ${ignored}`
+  if (k.gseWithdrawer === null) return `excluded — no GSE deposit by toBlock; ${ignored}`
+  return (
+    `excluded — the active GSE deposit has withdrawer ${k.gseWithdrawer}, which matches none of ` +
+    `this provider's stake records (the key was deposited outside the registry); ${ignored}`
+  )
 }
 
 export interface DiscoveryResult {
@@ -270,9 +332,35 @@ export async function discoverActiveDelegators(
     onProgress,
   })
 
-  // Dedupe per attester (last-write wins on re-stake)
+  // The GSE address is needed by the duplicate-key check (only when a key has
+  // several records) and by the registration check below. Resolve it once, on
+  // first use (the caller may have pre-fetched it).
+  let gseAddressCache: Address | undefined = input.gseAddress
+  const getGseAddress = async (): Promise<Address> => {
+    gseAddressCache ??= (await client.readContract({
+      address: rollupAddress,
+      abi: ISTAKING_GET_GSE_ABI,
+      functionName: "getGSE",
+      blockNumber: toBlock,
+    })) as Address
+    return gseAddressCache
+  }
+
+  // Step 1b: a key with several stake records keeps only the record whose
+  // deposit activated in the GSE — never simply the latest (or earliest) one.
+  const { rows: resolvedStakes, duplicateKeys } = await resolveDuplicateKeys({
+    client,
+    rows: stakeEvents,
+    getGseAddress,
+    fromBlock,
+    toBlock,
+    logChunkSize: input.stakeLogChunkSize ?? logChunkSize,
+    retryMeter,
+  })
+
+  // One record per attester from here on.
   const byAttester = new Map<string, StakeRow>()
-  for (const ev of stakeEvents) {
+  for (const ev of resolvedStakes) {
     byAttester.set(ev.attester.toLowerCase(), ev)
   }
   const candidates = [...byAttester.values()]
@@ -281,6 +369,7 @@ export async function discoverActiveDelegators(
     uniqueAttesters: candidates.length,
     registeredOnRollup: 0,
     phantomAttesters: [],
+    duplicateKeys,
   }
   if (candidates.length === 0) return { delegators: [], stats }
 
@@ -297,14 +386,7 @@ export async function discoverActiveDelegators(
   // Step 3: resolve the GSE address (one read; can be skipped by the caller
   // pre-fetching it). The bonus-instance address is a contract-side constant
   // computed locally (`keccak256("bonus-instance")`), so no RPC needed.
-  const gseAddress =
-    input.gseAddress ??
-    ((await client.readContract({
-      address: rollupAddress,
-      abi: ISTAKING_GET_GSE_ABI,
-      functionName: "getGSE",
-      blockNumber: toBlock,
-    })) as Address)
+  const gseAddress = await getGseAddress()
   const bonusInstance = BONUS_INSTANCE_ADDRESS
 
   // Step 4: check `isRegistered` for each candidate at every activity-check
@@ -447,6 +529,9 @@ export async function probeProviderIds(input: {
 
 interface StakeRow {
   attester: Address
+  /** Rollup the stake deposited into (the event's indexed `rollupAddress`);
+   *  its `ValidatorQueued` log in the same tx carries the real withdrawer. */
+  rollupAddress: Address
   splitAddress: Address
   stakerImplementation: Address
   stakedAtBlock: bigint
@@ -501,11 +586,13 @@ async function scanStakeEvents(input: ScanStakeEventsInput): Promise<StakeRow[]>
       const decoded = decodeEventLog({ abi: [STAKED_WITH_PROVIDER_EVENT], data: log.data, topics: log.topics })
       const args = decoded.args as {
         attester: Address
+        rollupAddress: Address
         coinbaseSplitContractAddress: Address
         stakerImplementation: Address
       }
       return {
         attester: getAddress(args.attester) as Address,
+        rollupAddress: getAddress(args.rollupAddress) as Address,
         splitAddress: getAddress(args.coinbaseSplitContractAddress) as Address,
         stakerImplementation: getAddress(args.stakerImplementation) as Address,
         stakedAtBlock: log.blockNumber ?? 0n,
@@ -520,6 +607,171 @@ async function scanStakeEvents(input: ScanStakeEventsInput): Promise<StakeRow[]>
   })
 
   return perRange.flat()
+}
+
+interface ResolveDuplicateKeysInput {
+  client: PublicClient
+  rows: readonly StakeRow[]
+  getGseAddress: () => Promise<Address>
+  /** Start of the GSE `Deposit` scan — the same start as the stake scan, not
+   *  the first stake record: a key can be deposited directly (outside the
+   *  registry) before any delegator is handed it. */
+  fromBlock: bigint
+  toBlock: bigint
+  logChunkSize: bigint
+  retryMeter?: { retries: number }
+}
+
+/** Attesters per `eth_getLogs` OR-filter — keeps the topic list well under
+ *  common RPC limits. */
+const ATTESTERS_PER_DEPOSIT_QUERY = 100
+
+/**
+ * Reduce every key to at most one stake record.
+ *
+ * A key normally has exactly one `StakedWithProvider` record. It has several
+ * when the provider queued the same key more than once: the registry hands
+ * out each queued copy to a new stake, and every stake emits its own record
+ * and creates its own split. An attester address can register in the GSE only
+ * once, so only one of those deposits activates; the others fail at the rollup
+ * (`FailedDeposit`) and are refunded to their withdrawer. Their records and
+ * splits stay on-chain, and record order says nothing about which deposit won.
+ *
+ * For those keys only, read the GSE `Deposit` events from `fromBlock` up to
+ * `toBlock` and keep the record whose queued withdrawer (from its
+ * `ValidatorQueued` log) is the deposit's `withdrawer`. If no deposit had
+ * activated by `toBlock`, the attester cannot have proposed in the window and
+ * no record is kept. If a deposit exists but matches no record, the key was
+ * deposited outside the registry and no record is kept either. If several
+ * records share the withdrawer, keep the earliest: the rollup's entry queue is
+ * FIFO, so it is the one that activated.
+ *
+ * Keys with a single record pass through untouched and cost no RPC calls.
+ */
+async function resolveDuplicateKeys(
+  input: ResolveDuplicateKeysInput,
+): Promise<{ rows: StakeRow[]; duplicateKeys: DuplicateKeyResolution[] }> {
+  const { client, rows, getGseAddress, fromBlock, toBlock, logChunkSize, retryMeter } = input
+
+  const byAttester = new Map<string, StakeRow[]>()
+  for (const r of rows) {
+    const key = r.attester.toLowerCase()
+    const list = byAttester.get(key)
+    if (list) list.push(r)
+    else byAttester.set(key, [r])
+  }
+  const duplicated = [...byAttester.values()].filter((list) => list.length > 1)
+  if (duplicated.length === 0) return { rows: [...rows], duplicateKeys: [] }
+
+  const gseAddress = await getGseAddress()
+  const ranges: [bigint, bigint][] = []
+  for (let cursor = fromBlock; cursor <= toBlock; ) {
+    const chunkEnd = cursor + logChunkSize - 1n < toBlock ? cursor + logChunkSize - 1n : toBlock
+    ranges.push([cursor, chunkEnd])
+    cursor = chunkEnd + 1n
+  }
+  const attesterBatches: Address[][] = []
+  for (let i = 0; i < duplicated.length; i += ATTESTERS_PER_DEPOSIT_QUERY) {
+    attesterBatches.push(duplicated.slice(i, i + ATTESTERS_PER_DEPOSIT_QUERY).map((list) => list[0]!.attester))
+  }
+
+  const withdrawersByAttester = new Map<string, Set<string>>()
+  const queries = attesterBatches.flatMap((batch) => ranges.map((range) => ({ batch, range })))
+  const perQuery = await mapWithConcurrency(queries, LOG_SCAN_CONCURRENCY, ({ batch, range: [from, to] }) =>
+    withRetry(
+      () =>
+        client.getLogs({
+          address: gseAddress,
+          event: GSE_DEPOSIT_EVENT,
+          args: { attester: batch },
+          fromBlock: from,
+          toBlock: to,
+        }),
+      undefined,
+      undefined,
+      retryMeter,
+    ),
+  )
+  for (const log of perQuery.flat()) {
+    const decoded = decodeEventLog({ abi: [GSE_DEPOSIT_EVENT], data: log.data, topics: log.topics })
+    const args = decoded.args as { attester: Address; withdrawer: Address }
+    const key = args.attester.toLowerCase()
+    const set = withdrawersByAttester.get(key) ?? new Set<string>()
+    set.add(args.withdrawer.toLowerCase())
+    withdrawersByAttester.set(key, set)
+  }
+
+  // The withdrawer each record's stake queued: `ValidatorQueued(attester,
+  // withdrawer)` from the record's own rollup, in the record's own tx. It is
+  // the `_withdrawalAddress` passed to `stake()`, which the GSE `Deposit`
+  // carries — and which need not equal the record's msg.sender.
+  const queuedWithdrawer = await readQueuedWithdrawers({ client, rows: duplicated.flat(), retryMeter })
+
+  const discarded = new Set<StakeRow>()
+  const duplicateKeys: DuplicateKeyResolution[] = []
+  for (const list of duplicated) {
+    const attester = list[0]!.attester
+    const withdrawers = withdrawersByAttester.get(attester.toLowerCase()) ?? new Set<string>()
+    // `list` is in chain order. When several records share the withdrawer
+    // (the same withdrawer staked the key more than once), the earliest one
+    // is the deposit that activated: the rollup's entry queue is first in,
+    // first out, and the later deposits for the same attester fail as
+    // duplicates.
+    const selected = list.find((r) => withdrawers.has(queuedWithdrawer.get(r)!.toLowerCase()))
+    for (const r of list) if (r !== selected) discarded.add(r)
+    const gseWithdrawer = [...withdrawers][0]
+    duplicateKeys.push({
+      attester,
+      gseWithdrawer: gseWithdrawer ? (getAddress(gseWithdrawer) as Address) : null,
+      selectedStaker: selected ? selected.stakerImplementation : null,
+      discardedStakers: list.filter((r) => r !== selected).map((r) => r.stakerImplementation),
+    })
+  }
+
+  return { rows: rows.filter((r) => !discarded.has(r)), duplicateKeys }
+}
+
+/**
+ * Read, for each record, the withdrawer its stake queued at the rollup:
+ * `ValidatorQueued(attester, withdrawer)` emitted by the record's own rollup
+ * in the record's own transaction. One receipt per transaction. A record
+ * without that log cannot be verified, so stop rather than guess.
+ */
+async function readQueuedWithdrawers(input: {
+  client: PublicClient
+  rows: readonly StakeRow[]
+  retryMeter?: { retries: number }
+}): Promise<Map<StakeRow, Address>> {
+  const { client, rows, retryMeter } = input
+  const topic0 = encodeEventTopics({ abi: [VALIDATOR_QUEUED_EVENT] })[0]
+  const txHashes = [...new Set(rows.map((r) => r.txHash))]
+  const receipts = new Map<Hex, Awaited<ReturnType<PublicClient["getTransactionReceipt"]>>>()
+  await mapWithConcurrency(txHashes, RECEIPT_CONCURRENCY, async (txHash) => {
+    receipts.set(
+      txHash,
+      await withRetry(() => client.getTransactionReceipt({ hash: txHash }), undefined, undefined, retryMeter),
+    )
+  })
+
+  const out = new Map<StakeRow, Address>()
+  for (const r of rows) {
+    const log = receipts.get(r.txHash)!.logs.find((l) => {
+      if (l.topics[0] !== topic0 || l.address.toLowerCase() !== r.rollupAddress.toLowerCase()) return false
+      const args = decodeEventLog({ abi: [VALIDATOR_QUEUED_EVENT], data: l.data, topics: l.topics })
+        .args as { attester: Address }
+      return args.attester.toLowerCase() === r.attester.toLowerCase()
+    })
+    if (!log) {
+      throw new Error(
+        `Stake tx ${r.txHash} for attester ${r.attester} has no ValidatorQueued log from rollup ` +
+          `${r.rollupAddress}, so the withdrawer of that stake cannot be verified.`,
+      )
+    }
+    const args = decodeEventLog({ abi: [VALIDATOR_QUEUED_EVENT], data: log.data, topics: log.topics })
+      .args as { withdrawer: Address }
+    out.set(r, getAddress(args.withdrawer) as Address)
+  }
+  return out
 }
 
 interface ResolveSplitRecipientsInput {
