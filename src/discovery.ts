@@ -346,12 +346,14 @@ export async function discoverActiveDelegators(
     retryMeter,
   })
 
-  // One record per attester from here on.
+  // One record per attester from here on. Settlement mode (`includeInactive`)
+  // must use the resolved records too: the raw events still contain the
+  // failed stakes of duplicated keys, and those precede every later proposal.
   const byAttester = new Map<string, StakeRow>()
   for (const ev of resolvedStakes) {
     byAttester.set(ev.attester.toLowerCase(), ev)
   }
-  const candidates = input.includeInactive ? stakeEvents : [...byAttester.values()]
+  const candidates = input.includeInactive ? resolvedStakes : [...byAttester.values()]
   const stats: DiscoveryStats = {
     stakeEventsFound: stakeEvents.length,
     uniqueAttesters: byAttester.size,

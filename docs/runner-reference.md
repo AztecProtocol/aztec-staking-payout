@@ -58,7 +58,7 @@ Settlement does not filter by current GSE registration. Accepted historical prop
 
 - `--dry-run`: run the accounting checks, print the plan, write the audit, send nothing.
 - `--emit-calldata [path]`: produce Safe Transaction Builder JSON, using direct token transfers. No private key is needed.
-- Live mode: sign and send with `PRIVATE_KEY`; the signer must be the configured distribution wallet. EOA multicall mode uses approval plus `aggregate3(transferFrom)`.
+- Live mode: sign and send with `PRIVATE_KEY`; the signer must be the configured distribution wallet. The default live shape is `disperse`: an optional `approve(Disperse, total)` plus one `Disperse.disperseTokenSimple(token, recipients, amounts)`, which spends only the caller's own allowance. Do not batch `transferFrom` through Multicall3: that mode was removed after an allowance drain.
 - `--simulate-reward`: hypothetical amount; forces dry-run and suppresses Safe export. Equal-split and delegator overrides are simulation-only.
 - `--ignore-coinbase`: allowed only together with `--simulate-reward`.
 

@@ -417,14 +417,33 @@ describe("discoverActiveDelegators", () => {
   const inputFor = (client: ReturnType<typeof makeClient>) => ({ client, stakingRegistryAddress: STAKING_REGISTRY,
     rollupAddress: ROLLUP, multicallAddress: MULTICALL3, providerId: 42n, fromBlock: 0n, toBlock: 1000n, logChunkSize: 10000n })
 
-  it("retains exited validators and uses the beneficiary at proposal time across a restake", async () => {
-    const fixtures = [fixture, { ...fixture, split: addr("52"), blockNumber: 200n, userRewardsRecipient: addr("e2") }]
-    const { delegators } = await discoverActiveDelegators({ ...inputFor(makeClient(fixtures)), includeInactive: true })
-    expect(delegators).toHaveLength(2)
+  it("settlement mode retains an exited validator and pays only proposals made after its stake", async () => {
+    // `fixture` is no longer registered (active: false). Its accepted
+    // proposals are still owed to its beneficiary. An attester address
+    // registers in the GSE only once, so a key has one activated stake; the
+    // selection is by block and log position within the block.
+    const { delegators } = await discoverActiveDelegators({ ...inputFor(makeClient([fixture])), includeInactive: true })
+    expect(delegators).toHaveLength(1)
     expect(delegatorAtProposal(delegators, fixture.attester, 99n, 1)).toBeUndefined()
-    expect(delegatorAtProposal(delegators, fixture.attester, 150n, 1)?.delegator).toBe(addr("e1"))
-    expect(delegatorAtProposal(delegators, fixture.attester, 200n, 0)?.delegator).toBe(addr("e1"))
-    expect(delegatorAtProposal(delegators, fixture.attester, 200n, 2)?.delegator).toBe(addr("e2"))
+    expect(delegatorAtProposal(delegators, fixture.attester, 100n, 0)).toBeUndefined()
+    expect(delegatorAtProposal(delegators, fixture.attester, 100n, 1)?.delegator).toBe(addr("e1"))
+    expect(delegatorAtProposal(delegators, fixture.attester, 150n, 0)?.delegator).toBe(addr("e1"))
+  })
+
+  it("settlement mode keeps only the stake whose deposit activated for a duplicated key", async () => {
+    // The provider queued the key twice. The first deposit activated; the
+    // second was queued later, failed at the rollup and was refunded, but its
+    // record and split stay on-chain — and it precedes every later proposal.
+    const fixtures: StakeFixture[] = [
+      { ...fixture, gseDepositAtBlock: 300n },
+      { ...fixture, staker: addr("d2"), split: addr("52"), blockNumber: 200n, userRewardsRecipient: addr("e2") },
+    ]
+    const { delegators, stats } = await discoverActiveDelegators({ ...inputFor(makeClient(fixtures)), includeInactive: true })
+    expect(delegators.map((d) => d.delegator)).toEqual([addr("e1")])
+    expect(delegatorAtProposal(delegators, fixture.attester, 900n, 0)?.delegator).toBe(addr("e1"))
+    expect(stats.duplicateKeys).toEqual([
+      { attester: addr("a1"), gseWithdrawer: addr("d1"), selectedStaker: addr("d1"), discardedStakers: [addr("d2")] },
+    ])
   })
 
   it("retries a failed receipt and aborts instead of falling back to the caller", async () => {

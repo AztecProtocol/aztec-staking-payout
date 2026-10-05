@@ -51,7 +51,7 @@ describe("settlement export accuracy gates", () => {
     vi.mocked(discoverActiveDelegators).mockResolvedValue({ delegators: [alice, bob].map((delegator, i) => ({
       delegator, attester: address(10 + i), splitAddress: address(20 + i), staker: address(30 + i),
       stakedAtBlock: 2n, stakedAtLogIndex: 0, delegatorSource: "split-recipient" as const,
-    })), stats: { stakeEventsFound: 2, uniqueAttesters: 2, registeredOnRollup: 0 } })
+    })), stats: { stakeEventsFound: 2, uniqueAttesters: 2, registeredOnRollup: 0, phantomAttesters: [], duplicateKeys: [] } })
     vi.mocked(countProposalsByProposer).mockResolvedValue({ totalCheckpoints: 2, unresolvedCheckpoints: 0,
       outOfRangeCheckpoints: 0, prunedAndReusedCheckpoints: 0, attributed: [0, 1].map((i) => ({
         checkpointNumber: BigInt(i + 1), proposer: address(10 + i), coinbase: wallet, blockNumber: 12n + BigInt(i),
@@ -80,7 +80,7 @@ describe("settlement export accuracy gates", () => {
   it("writes no payout when a wallet-bound checkpoint has no historical beneficiary", async () => {
     vi.mocked(discoverActiveDelegators).mockResolvedValueOnce({ delegators: [{ delegator: alice, attester: address(10),
       splitAddress: address(20), staker: address(30), stakedAtBlock: 2n, delegatorSource: "split-recipient" }],
-      stats: { stakeEventsFound: 1, uniqueAttesters: 1, registeredOnRollup: 0 } })
+      stats: { stakeEventsFound: 1, uniqueAttesters: 1, registeredOnRollup: 0, phantomAttesters: [], duplicateKeys: [] } })
     await expect(settle(opts)).rejects.toThrow(/no verified historical beneficiary/)
     expect(writeSafeImport).not.toHaveBeenCalled()
   })
