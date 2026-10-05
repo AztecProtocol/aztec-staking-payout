@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { resolve, join } from "node:path"
 import { formatUnits, type Address, type Hex } from "viem"
 import type { SerializedPlannedTx } from "./calldata.js"
+import type { DuplicateKeyResolution } from "./discovery.js"
 import type { AttributionMode, DistributionEntry, SettlementPlan } from "./types.js"
 
 /**
@@ -90,6 +91,14 @@ export interface AuditRecord {
    *  distribution wallet, OR `--ignore-coinbase` was set). Omitted in
    *  equal-split mode. */
   attributedCheckpoints?: AuditedCheckpoint[]
+
+  /** Keys with more than one StakedWithProvider record for this provider, and
+   *  how each was resolved: the record whose queued withdrawer equals the GSE
+   *  `Deposit` withdrawer is used, the others are ignored. A null
+   *  `selectedStaker` means the key was excluded — no deposit by `toBlock`
+   *  (`gseWithdrawer` null), or the active deposit matches none of the
+   *  provider's records. Omitted when there are no such keys. */
+  duplicateKeys?: DuplicateKeyResolution[]
 
   /** Summary of the coinbase filter applied this run. Omitted in equal-split
    *  mode (no per-checkpoint coinbase data). */
