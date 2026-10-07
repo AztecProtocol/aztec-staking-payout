@@ -11,7 +11,7 @@ import { findDeployBlock } from "./discovery.js"
  * The settlement unit is the **epoch**, not the L1 block. An epoch is "ours to
  * settle" once two things are true:
  *
- *   1. The rollup proof for that epoch has landed on L1 (rewards have been
+ *   1. The epoch has ended and all its checkpoints have been proven on L1 (rewards have been
  *      credited to the operator's coinbase in `sequencerRewards`).
  *   2. The L1 block where that proof landed is itself L1-finalized (so a reorg
  *      can never invalidate it).
@@ -24,8 +24,7 @@ import { findDeployBlock } from "./discovery.js"
  *   - `fromBlock`, `toBlock`            — the L1 block range bounding the
  *     period's *rewards*: `fromBlock` is the L1 block where the proof for
  *     epoch `fromEpoch - 1` landed; `toBlock` is the L1 block where the proof
- *     for epoch `toEpoch` landed. `balanceOf(fromBlock)` and
- *     `balanceOf(toBlock)` define the period's net inflow.
+ *     for epoch `toEpoch` landed. Reward counters and claims across these blocks define the accrued reward.
  *
  * Both gates are enforced here. Caller gets a fully-resolved, finalised window
  * or an error — there is no "maybe proven, maybe not" middle state.
@@ -108,11 +107,11 @@ export interface EpochRange {
   fromCheckpoint: bigint
   /** Last L2 checkpoint number whose epoch == `toEpoch`. */
   toCheckpoint: bigint
-  /** L1 block immediately after the proof for `fromEpoch - 1` landed (or 0 if
-   *  `fromEpoch == 0`). `balanceOf(fromBlock)` includes all rewards from
+  /** L1 block of the proof for `fromEpoch - 1` landed (or 0 if
+   *  `fromEpoch == 0`). `getSequencerRewards(fromBlock)` includes all rewards from
    *  epochs `< fromEpoch` and **none** of `fromEpoch`'s rewards. */
   fromBlock: bigint
-  /** L1 block where the proof for `toEpoch` landed. `balanceOf(toBlock)`
+  /** L1 block where the proof for `toEpoch` landed. `getSequencerRewards(toBlock)`
    *  includes all rewards from epochs `[fromEpoch, toEpoch]`. */
   toBlock: bigint
   /** L1 finalized block at resolution time, recorded for the audit. */
@@ -194,21 +193,9 @@ export interface ResolveEpochRangeInput {
  * story) and replaces ~17×2 outer × ~26 inner binary searches with ~5 plain
  * binary searches.
  *
- * RPC budget (rough, on a non-batching RPC):
- *   - 1   : `getBlock({blockTag: 'finalized'})`
- *   - 1   : `getProvenCheckpointNumber()` at finalized
- *   - ~28 : safe lookup for `latestProvenEpoch` (binary search for the
- *           proposal block of the proven tip + 1 `getEpochForCheckpoint`)
- *   - ~28 : timestamp lookup for `fromCheckpoint` (1 `getTimestampForEpoch`
- *           + binary search L1 by timestamp + 1 `getTips`; skipped when
- *           `fromEpoch == 0`)
- *   - ~28 : timestamp lookup for `toCheckpoint` (skipped when
- *           `toEpoch == latestProvenEpoch` — toCheckpoint = provenTip)
- *   - ~26 : binary-search `getProvenCheckpointNumber` for `toBlock`
- *   - ~26 : same for `fromBlock` (skipped when `fromEpoch == 0`)
- *
- * Total: ~140 RPC calls, paid once per settlement. ~7× cheaper than the
- * previous nested-binary-search implementation, and constant in chain age.
+ * The proven tip may be inside a partially proven epoch. Read the actual
+ * epoch boundary even for the newest epoch, then verify adjacent checkpoint
+ * epochs before resolving the proof blocks. RPC failures must propagate.
  */
 export async function resolveEpochRange(input: ResolveEpochRangeInput): Promise<EpochRange> {
   const {
@@ -294,7 +281,7 @@ export async function resolveEpochRange(input: ResolveEpochRangeInput): Promise<
   // block (the rollup's per-checkpoint slot data lives in a circular buffer
   // that overwrites old entries; on chains where pruning isn't being
   // triggered, the buffer rolls past even the proven tip).
-  const latestProvenEpoch = await readEpochForCheckpointSafe(
+  const tipEpoch = await readEpochForCheckpointSafe(
     client,
     rollupAddress,
     provenCheckpointTip,
@@ -311,38 +298,30 @@ export async function resolveEpochRange(input: ResolveEpochRangeInput): Promise<
       }),
   )
 
-  // ---- 3. Resolve the `latest-proven` sentinel and apply the proven gate. ----
+  // A proof can cover only a prefix of an epoch. Only close an epoch after
+  // its wall-clock boundary has passed AND its last checkpoint is proven.
+  const nextEpochTimestamp = await withRetry(() => client.readContract({
+    address: rollupAddress, abi: GET_TIMESTAMP_FOR_EPOCH_ABI,
+    functionName: "getTimestampForEpoch", args: [tipEpoch + 1n], blockNumber: finalizedBlock,
+  }), undefined, undefined, retryMeter)
+  const finalizedTimestamp = (await withRetry(() => client.getBlock({ blockNumber: finalizedBlock }),
+    undefined, undefined, retryMeter)).timestamp
+  const tipEpochEnd = nextEpochTimestamp <= finalizedTimestamp
+    ? await readCheckpointAtEpochBoundary(client, rollupAddress, tipEpoch + 1n,
+        rollupDeployedAtBlock, finalizedBlock, retryMeter, "to", onProgress)
+    : provenCheckpointTip + 1n
+  const latestProvenEpoch = tipEpochEnd <= provenCheckpointTip ? tipEpoch : tipEpoch - 1n
+  if (latestProvenEpoch < 0n) throw new Error("No fully proven epoch is finalized yet")
   const toEpoch = toEpochInput ?? latestProvenEpoch
   if (toEpoch > latestProvenEpoch) {
-    throw new Error(
-      `toEpoch ${toEpoch} is not yet proven on L1 (latest proven epoch is ${latestProvenEpoch} ` +
-        `at finalized block ${finalizedBlock}). Re-run later, or use --to-epoch latest-proven.`,
-    )
+    throw new Error(`toEpoch ${toEpoch} is not yet proven in full on L1 (latest proven epoch is ${latestProvenEpoch} at finalized block ${finalizedBlock}). Partial epochs cannot be settled.`)
   }
-
-  // ---- 4. Find the checkpoint range via timestamp math. ----
-  //
-  // toCheckpoint is the last checkpoint in `toEpoch`. When toEpoch is the
-  // latest proven epoch, that's just provenTip (proofs end at epoch
-  // boundaries, so the proven tip is always the last checkpoint of *some*
-  // epoch). Otherwise: epoch `toEpoch` ends at L2 timestamp
-  // `getTimestampForEpoch(toEpoch + 1) - 1`; the L1 block at that timestamp
-  // has `getTips().pending == toCheckpoint` (all proposals for slots through
-  // the end of toEpoch are published by then, and no proposals for later
-  // epochs can have landed yet — slots have strict L1 deadlines).
-  const toCheckpoint =
-    toEpoch === latestProvenEpoch
-      ? provenCheckpointTip
-      : await readCheckpointAtEpochBoundary(
-          client,
-          rollupAddress,
-          toEpoch + 1n, // boundary = start of (toEpoch + 1) = end of toEpoch + 1
-          rollupDeployedAtBlock,
-          finalizedBlock,
-          retryMeter,
-          "to",
-          onProgress,
-        )
+  if (fromEpoch > toEpoch) throw new Error(`No fully proven epochs available from ${fromEpoch}`)
+  const toCheckpoint = toEpoch === tipEpoch
+    ? tipEpochEnd
+    : await readCheckpointAtEpochBoundary(client, rollupAddress, toEpoch + 1n,
+        rollupDeployedAtBlock, finalizedBlock, retryMeter, "to", onProgress)
+  if (toCheckpoint > provenCheckpointTip) throw new Error("Epoch end is not fully proven")
 
   // fromCheckpoint is the first checkpoint in `fromEpoch`. fromEpoch starts at
   // L2 timestamp `getTimestampForEpoch(fromEpoch)`; the L1 block immediately
@@ -370,6 +349,15 @@ export async function resolveEpochRange(input: ResolveEpochRangeInput): Promise<
       `No L2 checkpoints found in epoch range [${fromEpoch}, ${toEpoch}]. The epochs are proven ` +
         `but contain no proposals — likely all sequencer slots were missed. Nothing to settle.`,
     )
+  }
+
+  const atEpoch = (checkpoint: bigint) => readEpochForCheckpointSafe(
+    client, rollupAddress, checkpoint, rollupDeployedAtBlock, finalizedBlock, retryMeter)
+  if (await atEpoch(toCheckpoint) > toEpoch ||
+      (toCheckpoint < provenCheckpointTip && await atEpoch(toCheckpoint + 1n) <= toEpoch) ||
+      (fromCheckpoint > 0n && await atEpoch(fromCheckpoint - 1n) >= fromEpoch) ||
+      await atEpoch(fromCheckpoint) < fromEpoch) {
+    throw new Error("Epoch/checkpoint boundary mismatch; refusing to omit or overlap earned checkpoints")
   }
 
   // ---- 5. Binary-search for the L1 blocks where these proofs landed. We
@@ -586,18 +574,9 @@ async function findFirstL1BlockAtOrAfterTimestamp(
     step++
     onStep?.(step, lo, hi)
     const mid = (lo + hi) / 2n
-    let timestampAtMid: bigint
-    try {
-      const blk = await withRetry(
-        () => client.getBlock({ blockNumber: mid }),
-        undefined,
-        undefined,
-        retryMeter,
-      )
-      timestampAtMid = blk.timestamp
-    } catch {
-      timestampAtMid = 0n
-    }
+    const timestampAtMid = (await withRetry(
+      () => client.getBlock({ blockNumber: mid }), undefined, undefined, retryMeter,
+    )).timestamp
     if (timestampAtMid >= target) hi = mid
     else lo = mid + 1n
   }
@@ -684,13 +663,7 @@ async function findProposalBlockForCheckpoint(
     step++
     onStep?.(step, lo, hi)
     const mid = (lo + hi) / 2n
-    let pendingAtMid: bigint
-    try {
-      pendingAtMid = await readPendingCheckpointTip(client, rollupAddress, mid, retryMeter)
-    } catch {
-      // Pre-deploy block — no rollup state. Treat as pending = 0.
-      pendingAtMid = 0n
-    }
+    const pendingAtMid = await readPendingCheckpointTip(client, rollupAddress, mid, retryMeter)
     if (pendingAtMid >= target) hi = mid
     else lo = mid + 1n
   }
@@ -745,12 +718,7 @@ async function findBlockWhereTipReachesWithProgress(
     step++
     onStep(step, lo, hi)
     const mid = (lo + hi) / 2n
-    let tipAtMid: bigint
-    try {
-      tipAtMid = await readProvenCheckpointTip(client, rollupAddress, mid, retryMeter)
-    } catch {
-      tipAtMid = 0n
-    }
+    const tipAtMid = await readProvenCheckpointTip(client, rollupAddress, mid, retryMeter)
     if (tipAtMid >= target) hi = mid
     else lo = mid + 1n
   }

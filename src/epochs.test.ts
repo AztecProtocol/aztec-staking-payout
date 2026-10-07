@@ -181,6 +181,25 @@ function defaultChain(overrides: Partial<MockChain> = {}): MockChain {
 }
 
 describe("resolveEpochRange", () => {
+  it("leaves a partially proven epoch open, then includes its entire tail once proven", async () => {
+    // Epoch 9 contains checkpoints 288–319. Its first proof ends at 300.
+    const partial = defaultChain({ provenTipAtBlock: (B) => B >= 1000n ? 300n : B >= 100n ? (B / 100n) * 32n - 1n : 0n })
+    const input = { client: makeClient(partial), rollupAddress: ROLLUP, fromEpoch: 8n, toEpoch: null }
+    const out = await resolveEpochRange(input)
+    expect(out.latestProvenEpoch).toBe(8n)
+    expect(out.toCheckpoint).toBe(287n)
+    await expect(resolveEpochRange({ ...input, toEpoch: 9n })).rejects.toThrow(/Partial epochs/)
+    const completed = await resolveEpochRange({ ...input, client: makeClient(defaultChain()), toEpoch: 9n })
+    expect(completed.toCheckpoint).toBe(319n)
+  })
+
+  it("does not close an epoch while more checkpoints can still be proposed", async () => {
+    const chain = defaultChain({ finalizedBlock: 310n, provenTipAtBlock: (B) => B >= 300n ? 300n : B >= 100n ? (B / 100n) * 32n - 1n : 0n })
+    const out = await resolveEpochRange({ client: makeClient(chain), rollupAddress: ROLLUP, fromEpoch: 8n, toEpoch: null })
+    expect(out.toEpoch).toBe(8n)
+    expect(out.toCheckpoint).toBe(287n)
+  })
+
   it("resolves a happy-path window to the correct checkpoint range and L1 blocks", async () => {
     const chain = defaultChain()
     const out = await resolveEpochRange({
@@ -246,7 +265,7 @@ describe("resolveEpochRange", () => {
         fromEpoch: 8n,
         toEpoch: 10n, // latestProven is 9
       }),
-    ).rejects.toThrow(/not yet proven on L1/)
+    ).rejects.toThrow(/not yet proven in full on L1/)
   })
 
   it("rejects fromEpoch > toEpoch", async () => {
@@ -294,6 +313,7 @@ describe("resolveEpochRange", () => {
       epochOfCheckpoint,
       provenTipAtBlock,
       pendingTipAtBlock,
+      timestampForEpoch: (E) => E * 32n + 50n,
     }
     // Wire a transport wrapper that mirrors the on-chain revert:
     // `getEpochForCheckpoint(c)` at block B reverts whenever pending(B) - c

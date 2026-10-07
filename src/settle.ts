@@ -13,6 +13,7 @@ import { makePublicClient } from "./client.js"
 import { buildDistribution, buildWeightedDistribution, type WeightedDelegator } from "./attribution.js"
 import { buildPlannedTxs, serializePlannedTxs, writeSafeImport } from "./calldata.js"
 import {
+  delegatorAtProposal,
   describeDuplicateKey,
   discoverActiveDelegators,
   findDeployBlock,
@@ -20,6 +21,7 @@ import {
   type DuplicateKeyResolution,
 } from "./discovery.js"
 import { countProposalsByProposer } from "./proposals.js"
+import { readCheckpointRewards, buildRewardDistribution, reconcileRewards, type PayableCheckpoint, type CheckpointReward, type RewardReconciliation } from "./rewards.js"
 import { computeGasSpent } from "./gascost.js"
 import { resolveEpochRange, type EpochRange } from "./epochs.js"
 import { createInlineProgress } from "./progress.js"
@@ -118,8 +120,7 @@ export interface SettleOptions {
    *  consulted when `emitSafeImport` is true. */
   safeImportPath: string | null
   /** Manual override of the reward amount. When non-null, the canonical
-   *  protocol-derived amount (`oursProposed × per-checkpoint sequencer
-   *  reward`) is ignored and this value is used instead. Forces dry-run as a
+   *  sum of checkpoint earnings is ignored and this value is used instead. Forces dry-run as a
    *  safety: the operator wouldn't normally pay out a hypothetical amount.
    *  Useful for what-if sizing and as the *only* way to drive equal-split
    *  mode, which has no proposal count to multiply by. */
@@ -136,9 +137,7 @@ export interface SettleOptions {
    *  regardless of `header.coinbase`. Default (false) only counts checkpoints
    *  whose `coinbase == distributionWalletAddress` — the integrity gate
    *  that keeps the tool from promising more than actually landed in the
-   *  wallet. Set this for testnet runs, what-if simulation, or when the
-   *  operator manually pre-funded the distribution wallet to cover a
-   *  prior-coinbase period. */
+   *  wallet. Requires --simulate-reward and cannot emit a real payout. */
   ignoreCoinbase: boolean
 }
 
@@ -155,11 +154,10 @@ export interface SettleResult {
  * Orchestration:
  *   1. Resolve `[fromEpoch, toEpoch]` to an L1-finalized block range and
  *      checkpoint range (gates: epoch proven + L1 block finalized).
- *   2. Read distribution wallet's token balance at the derived fromBlock and
- *      toBlock (requires archival RPC). Their delta = period's net inflow.
- *   3. Discover active delegators from on-chain (or use config override).
- *   4. Count checkpoints each attester proposed within the epoch range.
- *   5. Proposal-weighted split + commission; or equal-split (override path).
+ *   2. Read reward configuration at the closing proof block.
+ *   3. Resolve historical stakes to verified split beneficiaries.
+ *   4. Attribute checkpoint rewards and net fees; reconcile to the rollup.
+ *   5. Sum actual earnings by beneficiary, then apply commission.
  *   6. Build planned txs in the chosen output mode:
  *        - "safe":     N top-level `ERC20.transfer` calls (one per
  *          delegator). Safe wraps them in MultiSend; works for Safes,
@@ -239,9 +237,8 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   // ---- 2. Initial reads — batched via Multicall3 at toBlock: token metadata,
   //         GSE address (for delegator discovery), and the rollup's reward
   //         config (for the per-checkpoint sequencer reward formula). Plus a
-  //         single eth_chainId. No balance reads: the reward we distribute is
-  //         derived from the protocol formula (oursProposed × per-checkpoint
-  //         sequencer reward), not from the wallet's balance delta. ----
+  //         single eth_chainId. Checkpoint rewards and net fees are reconciled
+  //         independently to the rollup's counter and claims later. ----
   console.log(`▸ Reading token metadata + GSE + reward config at L1 block ${toBlock}…`)
   const toContracts = [
     { address: config.tokenAddress, abi: ERC20_METADATA_ABI, functionName: "decimals" as const },
@@ -349,7 +346,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       scanFrom = await findDeployBlock(publicClient, config.stakingRegistryAddress, toBlock)
       console.log(`▸ StakingRegistry deployed at block ${scanFrom}`)
     }
-    console.log(`▸ Discovering active delegators from StakingRegistry events…`)
+    console.log(`▸ Discovering historical reward beneficiaries from StakingRegistry events…`)
     const progress = createInlineProgress()
     let result
     try {
@@ -370,6 +367,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         // under-paying their delegators for the proposals they did make.
         activityCheckBlocks: [fromBlock, toBlock],
         retryMeter: meter,
+        includeInactive: true,
         onProgress: progress.onProgress,
       })
     } finally {
@@ -378,7 +376,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     discovered = result.delegators
     delegatorList = discovered.map((d) => d.delegator)
     console.log(
-      `▸ Discovery: ${result.stats.stakeEventsFound} stake event(s) → ${result.stats.uniqueAttesters} attester(s) → ${result.stats.registeredOnRollup} active on rollup`,
+      `▸ Discovery: ${result.stats.stakeEventsFound} stake event(s) → ${result.stats.uniqueAttesters} attester(s) → ${discovered.length} verified historical stake mappings`,
     )
     for (const d of discovered) {
       console.log(`    · attester ${d.attester} → delegator ${d.delegator} (${d.delegatorSource})`)
@@ -412,6 +410,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   }
 
   if (delegatorList.length === 0) {
+    if (!manualOverride) throw new Error("No verified beneficiaries; refusing an unchecked settlement")
     console.log("▸ No active delegators for this provider. Exiting.")
     reportRpc()
     return writeNoopAudit({
@@ -467,6 +466,10 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   let weighted: WeightedDelegator[] = []
   let oursProposed = 0
   let attributedCheckpoints: AuditRecord["attributedCheckpoints"]
+  const rewardCheckpoints: PayableCheckpoint[] = []
+  let checkpointRewards: CheckpointReward[] = []
+  let rewardReconciliation: RewardReconciliation | undefined
+  if (ignoreCoinbase && !manualOverride) throw new Error("--ignore-coinbase requires --simulate-reward; real payouts must reconcile the distribution wallet")
   if (needCounts) {
     // The scan's *block* range is intentionally wider than [fromBlock, toBlock]:
     // proof submission lags proposals, so the proof for `fromEpoch - 1`
@@ -508,19 +511,16 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     // Without it, a mid-window coinbase switch would have the tool promise
     // delegators more than the wallet can fund.
     //
-    // Operators who genuinely want to count all of their attesters'
-    // checkpoints regardless of where the reward routed can pass
-    // `--ignore-coinbase` (testnet runs, what-if simulation, or a case
-    // where the operator manually funded the distribution wallet to cover
-    // a prior-coinbase period).
+    // --ignore-coinbase is available only with --simulate-reward.
     //
     // Either way, every checkpoint by one of our attesters is recorded in
     // `attributedCheckpoints` with a `counted` flag, so the audit JSON
     // shows the full trail and the auditor can see exactly which entries
     // were dropped and why.
-    const ourAttesters = new Map<string, { attester: Address; delegator: Address }>()
-    for (const d of discovered) {
-      ourAttesters.set(d.attester.toLowerCase(), { attester: d.attester, delegator: d.delegator })
+    const ourAttesters = new Map(discovered.map((d) => [d.attester.toLowerCase(), d]))
+    const expectedCheckpoints = toCheckpoint - (fromCheckpoint > 0n ? fromCheckpoint : 1n) + 1n
+    if (BigInt(counts.totalCheckpoints) !== expectedCheckpoints) {
+      throw new Error(`Incomplete checkpoint scan: found ${counts.totalCheckpoints}, expected ${expectedCheckpoints}`)
     }
     const distWallet = config.distributionWalletAddress.toLowerCase()
     const ourPerAttester = new Map<string, number>()
@@ -529,11 +529,15 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     attributedCheckpoints = []
     for (const c of counts.attributed) {
       const attesterKey = c.proposer.toLowerCase()
-      const ours = ourAttesters.get(attesterKey)
-      if (!ours) continue
+      const ours = delegatorAtProposal(discovered, c.proposer, c.blockNumber, c.logIndex)
       const coinbaseMatches = c.coinbase.toLowerCase() === distWallet
+      if (!ours) {
+        if (coinbaseMatches) throw new Error(`Checkpoint ${c.checkpointNumber} paid this wallet but has no verified historical beneficiary`)
+        continue
+      }
       const counted = ignoreCoinbase || coinbaseMatches
       if (counted) {
+        rewardCheckpoints.push({ ...c, delegator: ours.delegator })
         ourPerAttester.set(attesterKey, (ourPerAttester.get(attesterKey) ?? 0) + 1)
       } else {
         droppedDueToCoinbase++
@@ -546,6 +550,8 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         delegator: ours.delegator,
         coinbase: c.coinbase,
         counted,
+        splitAddress: ours.splitAddress,
+        stakedAtBlock: ours.stakedAtBlock.toString(),
       })
       if (!coinbaseMatches) {
         const m =
@@ -556,11 +562,17 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       }
     }
 
-    weighted = discovered.map((d) => ({
-      delegator: d.delegator,
-      weight: ourPerAttester.get(d.attester.toLowerCase()) ?? 0,
-    }))
-    oursProposed = weighted.reduce((acc, w) => acc + w.weight, 0)
+    // Hypothetical weighted distributions count each contributing attester
+    // once per beneficiary, even if it proposed many checkpoints.
+    const weightedByStake = new Map<string, WeightedDelegator>()
+    for (const c of rewardCheckpoints) {
+      const key = `${c.proposer.toLowerCase()}:${c.delegator.toLowerCase()}`
+      const row = weightedByStake.get(key) ?? { delegator: c.delegator, weight: 0 }
+      row.weight++
+      weightedByStake.set(key, row)
+    }
+    weighted = [...weightedByStake.values()]
+    oursProposed = rewardCheckpoints.length
 
     const extras: string[] = []
     if (counts.unresolvedCheckpoints > 0) extras.push(`⚠ ${counts.unresolvedCheckpoints} unresolved`)
@@ -599,9 +611,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
       }
       if (!ignoreCoinbase) {
         console.log(
-          `    To count these anyway (e.g. you switched coinbase mid-window and have ` +
-            `pre-funded the distribution wallet to cover the prior period), re-run with ` +
-            `--ignore-coinbase.`,
+          `    To model these hypothetically, use --ignore-coinbase with --simulate-reward.`,
         )
       }
     }
@@ -647,38 +657,37 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     )
   }
 
-  // ---- Determine the reward to distribute ----
-  //
-  // Canonical source: the protocol formula. For each checkpoint a sequencer
-  // proposes, the rollup credits `checkpointReward × sequencerBps / 10000`
-  // tokens (read from `getRewardConfig` at toBlock). Total this period =
-  // oursProposed × that per-checkpoint amount. Reproducible, claim-timing
-  // independent, doesn't depend on the operator having actually claimed.
-  //
-  // Manual override (`--simulate-reward`): hypothetical amount, dry-run only.
-  // Useful for what-if sizing or for equal-split mode (which has no proposal
-  // count to multiply by).
-  //
-  // Known limitation: per-checkpoint variable transaction fees aren't
-  // included in the formula. The fixed `sequencerCheckpointReward` dominates;
-  // exact fee weighting would need parsing per-checkpoint `fees` from the
-  // epoch-proof calldata.
+  // Attribute each checkpoint's actual net earnings before applying commission.
+  // The independent counter/claims gate must succeed even when the modeled amount is zero.
   let rewardEarned: bigint
   if (manualOverride) {
     rewardEarned = simulateReward!
     console.log(`▸ Reward (manual override): ${fmt(rewardEarned)}`)
   } else {
-    rewardEarned = BigInt(oursProposed) * sequencerRewardPerCheckpoint
-    console.log(
-      `▸ Reward earned: ${oursProposed} checkpoint(s) × ${fmt(sequencerRewardPerCheckpoint)}` +
-        ` = ${fmt(rewardEarned)}`,
-    )
+    checkpointRewards = await readCheckpointRewards({
+      client: publicClient, rollupAddress: config.rollupAddress,
+      checkpoints: rewardCheckpoints, sequencerRewardPerCheckpoint, retryMeter: meter,
+    })
+    rewardEarned = checkpointRewards.reduce((sum, c) => sum + c.grossReward, 0n)
+    rewardReconciliation = await reconcileRewards({
+      client: publicClient, ...config, fromBlock, toBlock, modeledAccrual: rewardEarned, retryMeter: meter,
+    })
+    const byCheckpoint = new Map(checkpointRewards.map((c) => [c.checkpointNumber.toString(), c]))
+    for (const c of attributedCheckpoints ?? []) {
+      const reward = byCheckpoint.get(c.checkpointNumber)
+      if (reward) {
+        c.fixedReward = reward.fixedReward.toString()
+        c.sequencerFee = reward.sequencerFee.toString()
+        c.grossReward = reward.grossReward.toString()
+      }
+    }
+    console.log(`▸ Exact checkpoint rewards + fees: ${fmt(rewardEarned)}; on-chain reconciliation passed`)
   }
 
   if (rewardEarned === 0n) {
     if (attributionMode === "proposals") {
       console.log(
-        `▸ None of this operator's ${discovered.length} active attester(s) proposed a ` +
+        `▸ None of this operator's ${discovered.length} historical attester(s) proposed a ` +
           `checkpoint in epochs [${epochRange.fromEpoch}, ${epochRange.toEpoch}]. ` +
           `Nothing to distribute. Exiting.`,
       )
@@ -709,8 +718,9 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     })
   }
 
-  const entries =
-    attributionMode === "proposals"
+  const entries = !manualOverride
+    ? buildRewardDistribution(checkpointRewards, commissionBps, config.dustThreshold)
+    : attributionMode === "proposals"
       ? buildWeightedDistribution(weighted, rewardEarned, commissionBps, config.dustThreshold)
       : buildDistribution(delegatorList, rewardEarned, commissionBps, config.dustThreshold)
 
@@ -824,8 +834,10 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
           `whatever tool controls it.`,
       )
     }
-    // Live-mode pre-flight: ensure the wallet has enough to actually pay the
-    // transfers. The amount comes from the protocol formula (not balance), so
+  }
+  if (willSend || emitSafeImport) {
+    // Both Safe export and live sending require enough tokens to fund the
+    // transfers. Earnings come from checkpoint data and reward accounting, so
     // this catches the case where the operator hasn't claimed their accrued
     // sequencer rewards yet — see `rollup.claimSequencerRewards(coinbase)`.
     const currentBalance = (await publicClient.readContract({
@@ -839,7 +851,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         `Distribution wallet's current balance (${currentBalance}) is less than totalForwarded ` +
           `(${totalForwarded}). The operator needs to claim accrued sequencer rewards from the ` +
           `rollup first (rollup.claimSequencerRewards(${config.distributionWalletAddress})) so ` +
-          `the wallet holds enough to fund the distribution. Refusing to send.`,
+          `the wallet holds enough to fund the distribution. Refusing to emit or send.`,
       )
     }
   }
@@ -936,6 +948,17 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     },
     checkpointsProposed: oursProposed,
     rewardEarned: rewardEarned.toString(),
+    calculationVersion: 2,
+    rollup: config.rollupAddress,
+    chainId,
+    ...(rewardReconciliation ? { rewardReconciliation: {
+      counterBefore: rewardReconciliation.counterBefore.toString(),
+      counterAfter: rewardReconciliation.counterAfter.toString(),
+      claimedInWindow: rewardReconciliation.claimedInWindow.toString(),
+      measuredAccrual: rewardReconciliation.measuredAccrual.toString(),
+      modeledAccrual: rewardReconciliation.modeledAccrual.toString(),
+      claims: rewardReconciliation.claims.map((c) => ({ ...c, blockNumber: c.blockNumber.toString(), amount: c.amount.toString() })),
+    } } : {}),
     ...(gasCost
       ? {
           gasCost: {

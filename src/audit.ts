@@ -11,6 +11,14 @@ import type { AttributionMode, DistributionEntry, SettlementPlan } from "./types
  * (block range, policy snapshot, per-delegator amounts, tx hash).
  */
 export interface AuditRecord {
+  calculationVersion?: 2
+  rollup?: Address
+  chainId?: number
+  rewardReconciliation?: {
+    counterBefore: string; counterAfter: string; claimedInWindow: string
+    measuredAccrual: string; modeledAccrual: string
+    claims: Array<{ transactionHash: Hex; blockNumber: string; amount: string }>
+  }
   runId: string
   startedAt: string
   finishedAt: string
@@ -35,10 +43,10 @@ export interface AuditRecord {
    *  auditors who want to enumerate / spot-check every checkpoint. */
   fromCheckpoint: string
   toCheckpoint: string
-  /** L1 block where the proof for `fromEpoch - 1` landed (so `balanceOf` at
+  /** L1 block where the proof for `fromEpoch - 1` landed (so the sequencer reward counter at
    *  this block reflects "before any reward from `fromEpoch` had landed"). */
   fromBlock: string
-  /** L1 block where the proof for `toEpoch` landed (so `balanceOf` here
+  /** L1 block where the proof for `toEpoch` landed (so the sequencer reward counter here
    *  reflects "all rewards through `toEpoch` have landed"). */
   toBlock: string
   /** L1 finalized block at resolution time — confirms `toBlock` is finalised. */
@@ -55,9 +63,8 @@ export interface AuditRecord {
   }
   /** Number of checkpoints this operator's attesters proposed in the window. */
   checkpointsProposed: number
-  /** `checkpointsProposed × sequencerRewardPerCheckpoint` — what the
-   *  operator earned from the rollup this period (and what gets divided
-   *  among delegators per commission). */
+  /** Sum of fixed rewards and net sequencer fees for counted checkpoints.
+   *  Independently reconciled to reward-counter changes plus claims. */
   rewardEarned: string
   /** L1 gas spent on the propose() txs counted above — surfaced as a
    *  commission-tuning input, NOT subtracted from `rewardEarned`. Omitted
@@ -71,8 +78,7 @@ export interface AuditRecord {
 
   commissionBps: number
 
-  // How the delta was divided: "proposals" (weighted by checkpoints each
-  // attester proposed) or "equal-split" (flat pool).
+  // Attribution: actual checkpoint earnings, or a simulated equal pool.
   attributionMode: AttributionMode
 
   // What got transferred
@@ -158,11 +164,15 @@ export interface AuditTransfer {
  * configured `distributionWalletAddress`, but if any of the operator's
  * sequencers were set to route to a different coinbase (intermediate hot
  * wallet, multi-stage funding, or genuine misconfig), that shows up here.
- * The reward formula still counts these as earned (the rollup credited
- * *some* wallet the operator presumably controls); the console flags the
- * mismatch as a heads-up.
+ * Such checkpoints have counted=false and do not enter a real payout.
+ * Only a hypothetical --simulate-reward run can ignore the coinbase filter.
  */
 export interface AuditedCheckpoint {
+  splitAddress?: Address
+  stakedAtBlock?: string
+  fixedReward?: string
+  sequencerFee?: string
+  grossReward?: string
   /** L2 checkpoint number, as emitted by `CheckpointProposed`. */
   checkpointNumber: string
   /** L1 transaction hash of the `propose()` call that landed this checkpoint. */
@@ -259,7 +269,7 @@ export function formatPlanForHumans(plan: SettlementPlan): string {
   lines.push(`Paid to delegators:    ${human(plan.totalForwarded)}  (${plan.totalForwarded})`)
   lines.push(`Operator commission:   ${human(plan.operatorRetention)}  (${plan.operatorRetention})  ≈ ${effPct}% of reward`)
   lines.push(``)
-  const basis = plan.attributionMode === "proposals" ? "proposal-weighted" : "equal split"
+  const basis = plan.attributionMode === "proposals" ? "checkpoint earnings" : "equal split"
   lines.push(`Per-delegator transfers (${plan.entries.length} unique recipients; ${basis}):`)
   for (const e of plan.entries) {
     const short = `${e.delegator.slice(0, 10)}…${e.delegator.slice(-8)}`
