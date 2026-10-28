@@ -6,6 +6,9 @@ import type { DistributionEntry } from "./types.js"
 const FEE_HEADER_ABI = parseAbi([
   "function getFeeHeader(uint256) view returns ((uint256 excessMana,uint256 manaUsed,uint256 ethPerFeeAsset,uint256 congestionCost,uint256 proverCost))",
 ])
+const FEE_HEADER_ABI_V6 = parseAbi([
+  "function getFeeHeader(uint256) view returns ((uint256 excessMana,uint256 manaUsed,uint256 ethPerFeeAsset,uint256 protocolFee,uint256 proverCost))",
+])
 const COUNTER_ABI = parseAbi(["function getSequencerRewards(address) view returns (uint256)"])
 const CLAIM_ABI = parseAbi(["function claimSequencerRewards(address _sequencer) returns (uint256)"])
 const SAFE_ABI = parseAbi(["function execTransaction(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,bytes signatures) returns (bool)"])
@@ -13,6 +16,8 @@ const MULTISEND_ABI = parseAbi(["function multiSend(bytes transactions) payable"
 const AGGREGATE_ABI = parseAbi(["function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[])"])
 const TRANSFER = parseAbiItem("event Transfer(address indexed from,address indexed to,uint256 value)")
 const CONFIG_CHANGED = parseAbiItem("event RewardConfigUpdated((uint32 sequencerBps,uint96 checkpointReward) rewardConfig)")
+const CALCULATOR_ABI = parseAbi(["function getSequencerRewardCalculator() view returns (address)"])
+const CALCULATOR_CHANGED = parseAbiItem("event SequencerRewardCalculatorUpdated(address oldCalculator,address newCalculator)")
 
 export interface PayableCheckpoint extends AttributedCheckpoint { delegator: Address }
 export interface CheckpointReward extends PayableCheckpoint {
@@ -21,7 +26,7 @@ export interface CheckpointReward extends PayableCheckpoint {
   grossReward: bigint
 }
 
-/** Deployed v5 RewardLib: fee asset revenue less burn and the capped prover fee. */
+/** v5 burn / v6 protocol fee deduction, followed by the capped prover fee. */
 export function netSequencerFee(accumulatedFees: bigint, header: {
   manaUsed: bigint; congestionCost: bigint; proverCost: bigint
 }): bigint {
@@ -37,13 +42,24 @@ export async function readCheckpointRewards(input: {
 }): Promise<CheckpointReward[]> {
   return mapWithConcurrency(input.checkpoints, 12, async (c) => {
     if (c.accumulatedFees === undefined) {
-      throw new Error(`Checkpoint ${c.checkpointNumber} has no verifiable fee header (v5 required); refusing an approximate payout`)
+      throw new Error(`Checkpoint ${c.checkpointNumber} has no verifiable fee header (v5/v6 required); refusing an approximate payout`)
     }
-    const sequencerFee = c.accumulatedFees === 0n ? 0n : netSequencerFee(c.accumulatedFees,
-      await withRetry(() => input.client.readContract({
-        address: input.rollupAddress, abi: FEE_HEADER_ABI, functionName: "getFeeHeader",
-        args: [c.checkpointNumber], blockNumber: c.blockNumber,
-      }), undefined, undefined, input.retryMeter))
+    const accumulatedFees = c.accumulatedFees
+    let sequencerFee = 0n
+    if (accumulatedFees !== 0n) {
+      if (c.proposalVersion === "v6") {
+        const header = await withRetry(() => input.client.readContract({
+          address: input.rollupAddress, abi: FEE_HEADER_ABI_V6, functionName: "getFeeHeader",
+          args: [c.checkpointNumber], blockNumber: c.blockNumber,
+        }), undefined, undefined, input.retryMeter)
+        sequencerFee = netSequencerFee(accumulatedFees, { ...header, congestionCost: header.protocolFee })
+      } else {
+        sequencerFee = netSequencerFee(accumulatedFees, await withRetry(() => input.client.readContract({
+          address: input.rollupAddress, abi: FEE_HEADER_ABI, functionName: "getFeeHeader",
+          args: [c.checkpointNumber], blockNumber: c.blockNumber,
+        }), undefined, undefined, input.retryMeter))
+      }
+    }
     return { ...c, sequencerFee, fixedReward: input.sequencerRewardPerCheckpoint,
       grossReward: input.sequencerRewardPerCheckpoint + sequencerFee }
   })
@@ -128,6 +144,8 @@ export function assertRewardReconciliation(before: bigint, after: bigint, claims
 export async function reconcileRewards(input: {
   client: PublicClient; rollupAddress: Address; tokenAddress: Address; distributionWalletAddress: Address;
   fromBlock: bigint; toBlock: bigint; logChunkSize: bigint; modeledAccrual: bigint; retryMeter?: { retries: number }
+  /** v6 calculators may redistribute fixed rewards between checkpoints, even if their sum reconciles. */
+  requireDefaultV6Rewards?: boolean
 }): Promise<RewardReconciliation> {
   const { client, rollupAddress, distributionWalletAddress, retryMeter } = input
   const read = (blockNumber: bigint) => withRetry(() => client.readContract({
@@ -135,6 +153,14 @@ export async function reconcileRewards(input: {
     args: [distributionWalletAddress], blockNumber,
   }), undefined, undefined, retryMeter)
   const [counterBefore, counterAfter] = await Promise.all([read(input.fromBlock), read(input.toBlock)])
+  if (input.requireDefaultV6Rewards) {
+    const calculator = await withRetry(() => client.readContract({ address: rollupAddress,
+      abi: CALCULATOR_ABI, functionName: "getSequencerRewardCalculator", blockNumber: input.fromBlock,
+    }), undefined, undefined, retryMeter)
+    if (calculator.toLowerCase() !== "0x0000000000000000000000000000000000000000") {
+      throw new Error("Non-default v6 sequencer reward calculator; cannot safely attribute fixed checkpoint rewards")
+    }
+  }
   const claims: RewardReconciliation["claims"] = []
   const verified = new Set<string>()
   // End-of-block counters imply the exact interval (fromBlock, toBlock].
@@ -146,6 +172,11 @@ export async function reconcileRewards(input: {
       withRetry(() => client.getLogs({ address: rollupAddress, event: CONFIG_CHANGED, fromBlock, toBlock }), undefined, undefined, retryMeter),
     ])
     if (changes.length) throw new Error("Reward configuration changed within the window; split the settlement at that change")
+    if (input.requireDefaultV6Rewards) {
+      const calculatorChanges = await withRetry(() => client.getLogs({ address: rollupAddress,
+        event: CALCULATOR_CHANGED, fromBlock, toBlock }), undefined, undefined, retryMeter)
+      if (calculatorChanges.length) throw new Error("Sequencer reward calculator changed within the window; refusing an approximate v6 payout")
+    }
     for (const log of transfers) {
       if (log.args.value === undefined || log.blockNumber === null || !log.transactionHash) throw new Error("Incomplete reward transfer log")
       if (!verified.has(log.transactionHash)) {

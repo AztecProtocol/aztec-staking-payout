@@ -269,7 +269,7 @@ The design alternatives that were considered alongside this approach (an on-chai
 ## Testing
 
 ```bash
-npm test            # 47 unit tests, no network access required
+npm test            # offline unit/regression tests; no network access required
 npm run typecheck   # strict TypeScript
 ```
 
@@ -280,6 +280,6 @@ The tests use a mock viem transport so they exercise the real discovery / propos
 The tool is feature-complete for the weekly settlement workflow and has been verified against a live archival RPC. Open items:
 
 - **Discovery caching across runs.** Each run currently rescans the full registry history (~140 `eth_getLogs` chunks + ~200 stake-tx receipts ≈ 340 RPC calls every time). Persisting that between runs would cut subsequent runs by ~330 calls. Useful if you settle on a tight schedule and care about RPC budget.
-- **Protocol compatibility.** Real payouts currently require verifiable v5 proposal fee headers and unchanged reward configuration within the window. Unsupported states stop with an error.
+- **Protocol compatibility.** Proposal recovery supports v4, v5 and v6. Real payouts require verifiable v5/v6 fee headers and unchanged reward configuration within the window. V6 additionally requires the default (zero-address) sequencer reward calculator throughout the counter interval; custom or changing calculators stop the run even if aggregate rewards reconcile. See [v6 compatibility evidence](./docs/v6-compatibility.md).
 
 See [docs/runner-reference.md](./docs/runner-reference.md) for the deeper technical writeup.

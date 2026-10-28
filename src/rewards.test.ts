@@ -46,7 +46,18 @@ describe("exact checkpoint rewards", () => {
     expect(await readCheckpointRewards(input)).toMatchObject([{ sequencerFee: 82n, grossReward: 432n }])
     expect(readContract).toHaveBeenCalledWith(expect.objectContaining({ blockNumber: 10n, args: [1n] }))
     await expect(readCheckpointRewards({ ...input, checkpoints: [{ ...checkpoint(1n, alice), accumulatedFees: undefined }] }))
-      .rejects.toThrow(/v5 required/)
+      .rejects.toThrow(/v5\/v6 required/)
+  })
+
+  it("deducts the v6 protocol fee and caps prover compensation", async () => {
+    const readContract = vi.fn().mockResolvedValue({ manaUsed: 3n, protocolFee: 2n, proverCost: 4n })
+    const input = { client: { readContract } as unknown as PublicClient, rollupAddress: rollup,
+      checkpoints: [{ ...checkpoint(1n, alice, 100n), proposalVersion: "v6" as const }], sequencerRewardPerCheckpoint: 350n }
+    expect(await readCheckpointRewards(input)).toMatchObject([{ sequencerFee: 82n, grossReward: 432n }])
+    expect(await readCheckpointRewards({ ...input, checkpoints: [{ ...input.checkpoints[0]!, accumulatedFees: 10n }] }))
+      .toMatchObject([{ sequencerFee: 0n }])
+    await expect(readCheckpointRewards({ ...input, checkpoints: [{ ...input.checkpoints[0]!, accumulatedFees: 5n }] }))
+      .rejects.toThrow(/below/)
   })
 })
 
@@ -71,13 +82,16 @@ describe("independent reward reconciliation", () => {
     expect(isSequencerClaim(bob, encodeFunctionData({ abi: multiAbi, functionName: "multiSend", args: ["0x00"] }), rollup, wallet)).toBe(false)
   })
 
-  const fixture = (options: { badClaim?: boolean; configChanged?: boolean } = {}) => {
+  const fixture = (options: { badClaim?: boolean; configChanged?: boolean; calculator?: Address; calculatorChanged?: boolean } = {}) => {
     const getLogs = vi.fn(async (q: { event: { name: string }; fromBlock: bigint; toBlock: bigint }) => {
       if (q.event.name === "RewardConfigUpdated") return options.configChanged ? [{}] : []
+      if (q.event.name === "SequencerRewardCalculatorUpdated") return options.calculatorChanged ? [{}] : []
       return q.fromBlock <= 12n && q.toBlock >= 12n ? [{ args: { value: 400n }, blockNumber: 12n, transactionHash: hash }] : []
     })
     const client = { getLogs,
-      readContract: vi.fn(async ({ blockNumber }: { blockNumber: bigint }) => blockNumber === 10n ? 100n : 50n),
+      readContract: vi.fn(async ({ blockNumber, functionName }: { blockNumber: bigint; functionName: string }) =>
+        functionName === "getSequencerRewardCalculator" ? options.calculator ?? "0x0000000000000000000000000000000000000000"
+          : blockNumber === 10n ? 100n : 50n),
       getTransaction: vi.fn(async () => ({ to: rollup, input: options.badClaim ? "0x12345678" : claim })),
     } as unknown as PublicClient
     return { client, getLogs, input: { client, rollupAddress: rollup, tokenAddress: token,
@@ -95,5 +109,14 @@ describe("independent reward reconciliation", () => {
   it("refuses an unclassified transfer or a mid-window reward configuration change", async () => {
     await expect(reconcileRewards(fixture({ badClaim: true }).input)).rejects.toThrow(/Unverified rollup transfer/)
     await expect(reconcileRewards(fixture({ configChanged: true }).input)).rejects.toThrow(/configuration changed/)
+  })
+
+  it("accepts only default v6 fixed rewards, even if a calculator's total would reconcile", async () => {
+    expect(await reconcileRewards({ ...fixture().input, requireDefaultV6Rewards: true }))
+      .toMatchObject({ measuredAccrual: 350n })
+    await expect(reconcileRewards({ ...fixture({ calculator: alice }).input, requireDefaultV6Rewards: true }))
+      .rejects.toThrow(/Non-default v6/)
+    await expect(reconcileRewards({ ...fixture({ calculatorChanged: true }).input, requireDefaultV6Rewards: true }))
+      .rejects.toThrow(/calculator changed/)
   })
 })
