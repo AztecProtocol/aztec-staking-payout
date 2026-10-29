@@ -19,11 +19,12 @@ Pin both epoch bounds when reproducing a run. `latest-proven` means the latest *
 2. Read the fixed reward configuration at the closing proof block. Scan every checkpoint in the epoch interval and recover its proposer from the signed proposal calldata. Missing checkpoints or unresolved proposers stop the run.
 3. Resolve all historical stakes under the provider, including exited validators. For each proposal, select the stake that existed at that block and log position. A later restake cannot rewrite an earlier reward recipient.
 4. Count checkpoints whose coinbase is the distribution wallet. A wallet-bound checkpoint without a verified beneficiary stops the run. Checkpoints routed elsewhere are recorded but excluded.
-5. For each counted checkpoint, read accumulated fees from the v5 proposal header and the fee state at its proposal block. Calculate:
+5. For each counted checkpoint, read accumulated fees from the v5/v6 proposal header and the fee state at its proposal block. Calculate:
 
    ```text
    fixed = checkpointReward × sequencerBps / 10000
-   available = accumulatedFees − manaUsed × congestionCost
+   deductionPerMana = congestionCost (v5) or protocolFee (v6)
+   available = accumulatedFees − manaUsed × deductionPerMana
    sequencerFee = available − min(available, manaUsed × proverCost)
    checkpointEarnings = fixed + sequencerFee
    ```
@@ -42,7 +43,7 @@ Pin both epoch bounds when reproducing a run. `latest-proven` means the latest *
 7. Sum earnings by the beneficiary who earned each checkpoint. Apply commission **once per recipient**, rounding down in integer token base units. Fees are not pooled by checkpoint count. Dust below the configured threshold stays with the operator.
 8. Before Safe export or live sending, check that the wallet has enough tokens. Write a version 2 audit record containing the reward reconciliation, split addresses, fixed rewards, fees, proposal hashes and encoded transfers.
 
-A mismatch at any accuracy gate stops export and sending. The current accounting model requires v5 fee headers and a stable reward configuration. It deliberately stops on unsupported protocol data instead of estimating.
+A mismatch at any accuracy gate stops export and sending. The current accounting model requires v5/v6 fee headers and a stable reward configuration. V6 also requires a zero-address sequencer reward calculator at the opening counter snapshot and no calculator-update events in the counter interval. A custom calculator can redistribute rewards between checkpoints without changing their aggregate, so reconciliation alone would not establish correct beneficiary attribution. It deliberately stops on unsupported protocol data instead of estimating. See [v6 compatibility evidence](./v6-compatibility.md).
 
 ## Beneficiary verification
 

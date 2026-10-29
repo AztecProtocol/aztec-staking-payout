@@ -671,6 +671,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     rewardEarned = checkpointRewards.reduce((sum, c) => sum + c.grossReward, 0n)
     rewardReconciliation = await reconcileRewards({
       client: publicClient, ...config, fromBlock, toBlock, modeledAccrual: rewardEarned, retryMeter: meter,
+      requireDefaultV6Rewards: rewardCheckpoints.some((c) => c.proposalVersion === "v6"),
     })
     const byCheckpoint = new Map(checkpointRewards.map((c) => [c.checkpointNumber.toString(), c]))
     for (const c of attributedCheckpoints ?? []) {

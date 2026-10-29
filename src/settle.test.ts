@@ -30,16 +30,21 @@ const opts: SettleOptions = {
 
 describe("settlement export accuracy gates", () => {
   let measured: bigint
+  let v6: boolean
+  let calculator: Address
   beforeEach(() => {
     vi.clearAllMocks()
     vi.spyOn(console, "log").mockImplementation(() => {})
     measured = 800n
+    v6 = false
+    calculator = address(0)
     const client = {
       getChainId: vi.fn(async () => 1),
       multicall: vi.fn(async () => [0, "TEST", address(8), { checkpointReward: 350n, sequencerBps: 10000 }].map((result) => ({ status: "success", result }))),
       getLogs: vi.fn(async () => []),
       readContract: vi.fn(async (q: { functionName: string; blockNumber?: bigint }) => {
-        if (q.functionName === "getFeeHeader") return { manaUsed: 0n, congestionCost: 0n, proverCost: 0n }
+        if (q.functionName === "getFeeHeader") return { manaUsed: 0n, congestionCost: 0n, protocolFee: 0n, proverCost: 0n }
+        if (q.functionName === "getSequencerRewardCalculator") return calculator
         if (q.functionName === "getSequencerRewards") return q.blockNumber === 10n ? 0n : measured
         if (q.functionName === "balanceOf") return 1000n
         throw new Error(`Unexpected read ${q.functionName}`)
@@ -52,12 +57,13 @@ describe("settlement export accuracy gates", () => {
       delegator, attester: address(10 + i), splitAddress: address(20 + i), staker: address(30 + i),
       stakedAtBlock: 2n, stakedAtLogIndex: 0, delegatorSource: "split-recipient" as const,
     })), stats: { stakeEventsFound: 2, uniqueAttesters: 2, registeredOnRollup: 0, phantomAttesters: [], duplicateKeys: [] } })
-    vi.mocked(countProposalsByProposer).mockResolvedValue({ totalCheckpoints: 2, unresolvedCheckpoints: 0,
+    vi.mocked(countProposalsByProposer).mockImplementation(async () => ({ totalCheckpoints: 2, unresolvedCheckpoints: 0,
       outOfRangeCheckpoints: 0, prunedAndReusedCheckpoints: 0, attributed: [0, 1].map((i) => ({
         checkpointNumber: BigInt(i + 1), proposer: address(10 + i), coinbase: wallet, blockNumber: 12n + BigInt(i),
-        logIndex: 1, txHash: hash, accumulatedFees: i === 0 ? 100n : 0n,
+         logIndex: 1, txHash: hash, accumulatedFees: i === 0 ? 100n : 0n,
+         proposalVersion: v6 ? "v6" : "v5",
       })),
-    } as never)
+    } as never))
   })
   afterEach(() => vi.restoreAllMocks())
 
@@ -73,6 +79,21 @@ describe("settlement export accuracy gates", () => {
   it("writes no Safe file or success audit when the independent counter differs", async () => {
     measured = 801n
     await expect(settle(opts)).rejects.toThrow(/Reward reconciliation failed/)
+    expect(writeSafeImport).not.toHaveBeenCalled()
+    expect(writeAuditRecordToDisk).not.toHaveBeenCalled()
+  })
+
+  it("exports reconciled default v6 rewards", async () => {
+    v6 = true
+    const result = await settle(opts)
+    expect(result.plan?.entries.map((r) => [r.delegator, r.amount])).toEqual([[alice, 337n], [bob, 262n]])
+    expect(result.audit.rewardReconciliation).toMatchObject({ measuredAccrual: "800", modeledAccrual: "800" })
+  })
+
+  it("writes no v6 payout with a custom calculator even when aggregate earnings reconcile", async () => {
+    v6 = true
+    calculator = address(99)
+    await expect(settle(opts)).rejects.toThrow(/Non-default v6/)
     expect(writeSafeImport).not.toHaveBeenCalled()
     expect(writeAuditRecordToDisk).not.toHaveBeenCalled()
   })

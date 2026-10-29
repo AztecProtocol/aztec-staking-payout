@@ -38,15 +38,16 @@ export const CHECKPOINT_PROPOSED_EVENT = parseAbiItem(
  * only consume `_attestations`, `_signers` and `_attestationsAndSignersSignature`,
  * but ABI decoding is positional so the full shape is required.
  *
- * Two variants exist on mainnet. The v5 rollup (AZUP-2 upgrade) appended
+ * Three variants exist on mainnet. The v5 rollup (AZUP-2 upgrade) appended
  * `accumulatedFees` to `ProposedHeader` (ProposedHeaderLib.sol), changing the
  * function selector; every other parameter — attestations, signers, the
  * proposer's signature, blob input — is positionally identical, and
- * `header.coinbase` sits at the same component index. We build both ABIs from
- * a shared template and pick by selector at decode time, so settlements on
- * either rollup (and historical re-verification of v4 audits) keep working.
+ * `header.coinbase` sits at the same component index. We build the ABIs from
+ * a shared template and pick by selector at decode time. V6 also appends
+ * `bucketHint` to ProposeArgs, outside the header; its signature digest is
+ * unchanged from v5. Historical v4/v5 calldata remains supported.
  */
-const buildProposeAbi = (headerExtraComponents: readonly { name: string; type: string }[]) =>
+const buildProposeAbi = (headerExtraComponents: readonly { name: string; type: string }[], v6 = false) =>
   [
     {
       name: "propose",
@@ -70,7 +71,7 @@ const buildProposeAbi = (headerExtraComponents: readonly { name: string; type: s
                 { name: "lastArchiveRoot", type: "bytes32" },
                 { name: "blockHeadersHash", type: "bytes32" },
                 { name: "blobsHash", type: "bytes32" },
-                { name: "inHash", type: "bytes32" },
+                { name: v6 ? "inboxRollingHash" : "inHash", type: "bytes32" },
                 { name: "outHash", type: "bytes32" },
                 { name: "slotNumber", type: "uint256" },
                 { name: "timestamp", type: "uint256" },
@@ -88,6 +89,7 @@ const buildProposeAbi = (headerExtraComponents: readonly { name: string; type: s
                 ...headerExtraComponents,
               ],
             },
+            ...(v6 ? [{ name: "bucketHint", type: "uint256" }] as const : []),
           ],
         },
         {
@@ -118,6 +120,8 @@ const buildProposeAbi = (headerExtraComponents: readonly { name: string; type: s
 const PROPOSE_ABI_V4 = buildProposeAbi([])
 /** v5 rollup (AZUP-2): header gained `accumulatedFees`. */
 const PROPOSE_ABI_V5 = buildProposeAbi([{ name: "accumulatedFees", type: "uint256" }])
+/** v6: the unsigned inbox bucket lookup hint follows the header in ProposeArgs. */
+const PROPOSE_ABI_V6 = buildProposeAbi([{ name: "accumulatedFees", type: "uint256" }], true)
 
 /**
  * Sequencers commonly submit `propose()` wrapped inside a Multicall3 batch
@@ -165,16 +169,17 @@ const AGGREGATE_ABI = [
 
 /** Known `propose()` selectors → the ABI that decodes them and the rollup
  *  version, which determines the proposer-signature digest scheme (v4 signs
- *  an EIP-191 message over a domain-enum-prefixed hash; v5 signs EIP-712
+ *  an EIP-191 message over a domain-enum-prefixed hash; v5/v6 sign EIP-712
  *  typed data bound to the rollup contract — see
  *  `recoverProposerAndCoinbaseFromCalldata`). */
 type ProposeVariant = {
-  abi: typeof PROPOSE_ABI_V4 | typeof PROPOSE_ABI_V5
-  version: "v4" | "v5"
+  abi: typeof PROPOSE_ABI_V4 | typeof PROPOSE_ABI_V5 | typeof PROPOSE_ABI_V6
+  version: "v4" | "v5" | "v6"
 }
 const PROPOSE_ABI_BY_SELECTOR = new Map<string, ProposeVariant>([
   [toFunctionSelector(PROPOSE_ABI_V4[0]).toLowerCase(), { abi: PROPOSE_ABI_V4, version: "v4" }],
   [toFunctionSelector(PROPOSE_ABI_V5[0]).toLowerCase(), { abi: PROPOSE_ABI_V5, version: "v5" }],
+  [toFunctionSelector(PROPOSE_ABI_V6[0]).toLowerCase(), { abi: PROPOSE_ABI_V6, version: "v6" }],
 ])
 const AGGREGATE3_SELECTOR = toFunctionSelector(AGGREGATE3_ABI[0]).toLowerCase()
 const AGGREGATE_SELECTOR = toFunctionSelector(AGGREGATE_ABI[0]).toLowerCase()
@@ -183,7 +188,7 @@ const AGGREGATE_SELECTOR = toFunctionSelector(AGGREGATE_ABI[0]).toLowerCase()
  * Extract the `propose()` calldata from a transaction's input — whether the
  * sequencer called `propose()` directly or wrapped it in a Multicall3
  * `aggregate3`/`aggregate` batch. Matches any known propose variant (v4 or
- * v5 selector). Requires exactly one matching call to the configured rollup;
+ * v5 or v6 selector). Requires exactly one matching call to the configured rollup;
  * ambiguous batches cannot safely associate an event with its beneficiary.
  */
 function extractProposeCalldata(input: Hex, rollupAddress: Address): Hex {
@@ -257,7 +262,7 @@ type DecodedSignature = { v: number; r: Hex; s: Hex }
  *   - v4: EIP-191 personal message over
  *     `keccak256(abi.encode(uint8(2), _attestations, _signers))`
  *     (ValidatorSelectionLib.verifyProposer, AttestationLib domain enum).
- *   - v5: EIP-712 typed data — domain ("Aztec Rollup", "1", chainId, rollup)
+ *   - v5/v6: EIP-712 typed data — domain ("Aztec Rollup", "1", chainId, rollup)
  *     over `AttestationsAndSigners(bytes32 payloadHash)` with
  *     `payloadHash = keccak256(abi.encode(_attestations, _signers))`;
  *     recovered from the RAW digest (no EIP-191 prefix) —
@@ -274,7 +279,7 @@ async function recoverProposerAndCoinbaseFromCalldata(
   input: Hex,
   rollupAddress: Address,
   chainId: number,
-): Promise<{ proposer: Address; coinbase: Address; accumulatedFees?: bigint }> {
+): Promise<{ proposer: Address; coinbase: Address; accumulatedFees?: bigint; proposalVersion: ProposeVariant["version"] }> {
   const proposeData = extractProposeCalldata(input, rollupAddress)
   // Selector is guaranteed known here — extractProposeCalldata only returns
   // calldata whose selector is in the map.
@@ -322,7 +327,7 @@ async function recoverProposerAndCoinbaseFromCalldata(
       signature: { r: signature.r, s: signature.s, v: BigInt(signature.v) },
     })
   }
-  return { proposer, coinbase, accumulatedFees: argsTuple.header.accumulatedFees }
+  return { proposer, coinbase, accumulatedFees: argsTuple.header.accumulatedFees, proposalVersion: variant.version }
 }
 
 export type ProposalProgress =
@@ -360,8 +365,10 @@ export interface ProposalCountsInput {
  * recompute the split by looking up each checkpoint on chain).
  */
 export interface AttributedCheckpoint {
+  /** Calldata variant; v6 deducts a protocol fee instead of v5's congestion burn. */
+  proposalVersion?: ProposeVariant["version"]
   logIndex: number
-  /** v5 accumulated fees, before congestion burn and prover share. */
+  /** v5/v6 accumulated fees, before protocol deduction and prover share. */
   accumulatedFees?: bigint
   checkpointNumber: bigint
   txHash: Hex
@@ -527,7 +534,7 @@ export async function countProposalsByProposer(
   // One eth_chainId up front — the v5 digest is EIP-712 and binds the chain id
   // (and the rollup address, which we already have) into the signed payload.
   const chainId = await withRetry(() => client.getChainId(), undefined, undefined, retryMeter)
-  const decodedByTx = new Map<Hex, { proposer: Address; coinbase: Address; accumulatedFees?: bigint }>()
+  const decodedByTx = new Map<Hex, { proposer: Address; coinbase: Address; accumulatedFees?: bigint; proposalVersion: ProposeVariant["version"] }>()
   const recordUnresolved = (msg: string) => {
     if (counts.firstUnresolvedError === undefined) counts.firstUnresolvedError = msg
   }
@@ -548,12 +555,12 @@ export async function countProposalsByProposer(
       return
     }
     try {
-      const { proposer, coinbase, accumulatedFees } = await recoverProposerAndCoinbaseFromCalldata(
+      const { proposer, coinbase, accumulatedFees, proposalVersion } = await recoverProposerAndCoinbaseFromCalldata(
         calldata,
         rollupAddress,
         chainId,
       )
-      decodedByTx.set(txHash, { proposer: getAddress(proposer), coinbase: getAddress(coinbase), accumulatedFees })
+      decodedByTx.set(txHash, { proposer: getAddress(proposer), coinbase: getAddress(coinbase), accumulatedFees, proposalVersion })
     } catch (e) {
       recordUnresolved(`tx ${txHash}: could not decode propose()/recover proposer: ${(e as Error).message}`)
     }
@@ -580,6 +587,7 @@ export async function countProposalsByProposer(
       blockNumber: ev.blockNumber,
       logIndex: ev.logIndex,
       accumulatedFees: decoded.accumulatedFees,
+      proposalVersion: decoded.proposalVersion,
       proposer: decoded.proposer,
       coinbase: decoded.coinbase,
     })
