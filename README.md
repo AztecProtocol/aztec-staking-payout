@@ -30,7 +30,8 @@ All of these go in a YAML config — see [config.example.yaml](./config.example.
 
 ## Quickstart
 
-Use Node 24.22.1, pinned in `.nvmrc`, for every operator run. Node includes its
+Use Node 24.22.1, pinned in `.nvmrc`, for every operator run. The tool supports
+the current Active LTS line (Node 24) only. Node includes its
 own public CA roots, so updating npm dependencies or the host CA package alone
 does not replace the CLI's runtime trust store. The supported Node range is
 `^24.22.1`; check `node --version` in the shell or scheduled runner that executes
