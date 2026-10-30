@@ -30,10 +30,19 @@ All of these go in a YAML config — see [config.example.yaml](./config.example.
 
 ## Quickstart
 
+Use Node 24.22.1, pinned in `.nvmrc`, for every operator run. The tool supports
+the current Active LTS line (Node 24) only. Node includes its
+own public CA roots, so updating npm dependencies or the host CA package alone
+does not replace the CLI's runtime trust store. The supported Node range is
+`^24.22.1`; check `node --version` in the shell or scheduled runner that executes
+the tool. Existing installations need the actual Node executable updated too.
+
 ```bash
 git clone <this repo>
 cd aztec-staking-payout
-npm install
+nvm install
+nvm use
+npm ci
 
 # 1. Copy the example config and fill in your values.
 cp config.example.yaml ./config.yaml

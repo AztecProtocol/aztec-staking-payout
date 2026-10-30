@@ -5,7 +5,9 @@ The runner reconstructs each beneficiary's checkpoint earnings, subtracts the co
 ## Quick start
 
 ```bash
-npm install
+nvm install   # Node 24.22.1, pinned in .nvmrc
+nvm use
+npm ci
 npm test
 npm run build
 node dist/cli.js settle --config ./config.yaml --from-epoch 2851 --to-epoch 3113 --emit-calldata
