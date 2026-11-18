@@ -49,6 +49,18 @@ describe("exact checkpoint rewards", () => {
       .rejects.toThrow(/v5\/v6 required/)
   })
 
+  it("uses calculator-resolved rewards and refuses a checkpoint the calculator did not cover", async () => {
+    const readContract = vi.fn().mockResolvedValue({ manaUsed: 0n, protocolFee: 0n, proverCost: 0n })
+    const input = { client: { readContract } as unknown as PublicClient, rollupAddress: rollup,
+      checkpoints: [checkpoint(1n, alice), checkpoint(2n, bob)], sequencerRewardPerCheckpoint: 350n,
+      rewardByCheckpoint: new Map([[1n, 0n], [2n, 350n]]) }
+    expect(await readCheckpointRewards(input)).toMatchObject([
+      { fixedReward: 0n, grossReward: 0n }, { fixedReward: 350n, grossReward: 350n },
+    ])
+    await expect(readCheckpointRewards({ ...input, rewardByCheckpoint: new Map([[1n, 0n]]) }))
+      .rejects.toThrow(/No calculator reward resolved for checkpoint 2/)
+  })
+
   it("deducts the v6 protocol fee and caps prover compensation", async () => {
     const readContract = vi.fn().mockResolvedValue({ manaUsed: 3n, protocolFee: 2n, proverCost: 4n })
     const input = { client: { readContract } as unknown as PublicClient, rollupAddress: rollup,
@@ -111,12 +123,20 @@ describe("independent reward reconciliation", () => {
     await expect(reconcileRewards(fixture({ configChanged: true }).input)).rejects.toThrow(/configuration changed/)
   })
 
-  it("accepts only default v6 fixed rewards, even if a calculator's total would reconcile", async () => {
+  it("accepts a non-zero calculator only when it is the modelled one and stays in place", async () => {
     expect(await reconcileRewards({ ...fixture().input, requireDefaultV6Rewards: true }))
       .toMatchObject({ measuredAccrual: 350n })
+    // Without a modelled calculator, a non-zero one is still refused.
     await expect(reconcileRewards({ ...fixture({ calculator: alice }).input, requireDefaultV6Rewards: true }))
       .rejects.toThrow(/Non-default v6/)
-    await expect(reconcileRewards({ ...fixture({ calculatorChanged: true }).input, requireDefaultV6Rewards: true }))
+    // Modelled calculator: reconciliation proceeds against the real counter.
+    expect(await reconcileRewards({ ...fixture({ calculator: alice }).input, calculator: alice }))
+      .toMatchObject({ measuredAccrual: 350n })
+    // A different calculator in effect at fromBlock is not what was modelled.
+    await expect(reconcileRewards({ ...fixture({ calculator: bob }).input, calculator: alice }))
+      .rejects.toThrow(/not the calculator in effect/)
+    // Replacement inside the window mixes two policies.
+    await expect(reconcileRewards({ ...fixture({ calculator: alice, calculatorChanged: true }).input, calculator: alice }))
       .rejects.toThrow(/calculator changed/)
   })
 })

@@ -20,10 +20,18 @@ byte for byte. This is a source comparison, not an independent bytecode audit.
 - The fourth fee-header word is now `protocolFee`, formerly `congestionCost`.
   RewardLib deducts `manaUsed * protocolFee`, then caps the prover payment to
   the remaining fees. The deduction goes to a protocol recipient, not a burn.
-- V6 optionally supports a sequencer reward calculator. This runner refuses
-  non-default or changing calculators; it does not approximate their
-  per-checkpoint rewards. Counter reconciliation, reward-config change
-  detection, finalized complete epochs and all beneficiary gates still apply.
+- V6 optionally supports a sequencer reward calculator. The runner resolves a
+  non-zero `getSequencerRewardCalculator()` per checkpoint, at the L1 block
+  where that checkpoint's epoch proof landed, and reconciles the resulting
+  amounts against the same counter delta as before. It still refuses a
+  calculator that is replaced inside the window, and it pays the default reward
+  for a proof whose calculator call reverts or returns malformed data, matching
+  `SequencerRewardCalculatorLib`. Resolution assumes the calculator's value for
+  a checkpoint depends only on that checkpoint's epoch and proposer (true for
+  the reference `RegistryReductionCalculator`); a calculator that depends on the
+  whole proposer array will not reconcile and the run stops. Counter
+  reconciliation, reward-config change detection, finalized complete epochs and
+  all beneficiary gates still apply.
 
 ## Offline mainnet regression fixtures
 
