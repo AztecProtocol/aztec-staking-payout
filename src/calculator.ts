@@ -1,7 +1,7 @@
 import {
   BaseError,
-  ContractFunctionRevertedError,
-  ContractFunctionZeroDataError,
+  ExecutionRevertedError,
+  InvalidInputRpcError,
   decodeFunctionResult,
   encodeFunctionData,
   parseAbi,
@@ -18,8 +18,8 @@ import type { AttributedCheckpoint } from "./proposals.js"
  * Governance-set v6 sequencer reward calculator.
  *
  * The rollup calls this once per epoch proof with one proposer per newly
- * proven checkpoint, in checkpoint order, and credits `rewards[i]` (plus the
- * sequencer fee) to that checkpoint's coinbase. See
+ * proven checkpoint — every provider's, in checkpoint order — and credits
+ * `rewards[i]` (plus the sequencer fee) to that checkpoint's coinbase. See
  * `ISequencerRewardCalculator` / `RewardLib.distributeCheckpointRewards` in
  * aztec-packages.
  */
@@ -38,7 +38,7 @@ const PROOF_VERIFIED = parseAbiItem("event L2ProofVerified(uint256 indexed check
 /** Rollup's validity bound on one checkpoint's sequencer reward. */
 export const MAX_SEQUENCER_REWARD_PER_CHECKPOINT = 1_000_000n * 10n ** 18n
 
-/** The rollup forwards exactly this stipend to the calculator. */
+/** The gas the rollup forwards to the calculator for a proof of `n` checkpoints. */
 export const CALCULATOR_GAS_BASE = 200_000n
 export const CALCULATOR_GAS_PER_CHECKPOINT = 100_000n
 
@@ -46,7 +46,11 @@ export interface CalculatorRewardInput {
   client: PublicClient
   rollupAddress: Address
   calculator: Address
-  /** This operator's checkpoints in the window, each with its proposal block. */
+  /** Every checkpoint in the settlement window — all providers, all coinbases —
+   *  because the rollup passes one proposer per newly proven checkpoint of the
+   *  proof, not just this operator's subset. A calculator that positions or
+   *  batches rewards over that array would otherwise be modelled against a
+   *  different call than the chain made. */
   checkpoints: readonly AttributedCheckpoint[]
   /** `checkpointReward * sequencerBps / 10000`, as the rollup computes it. */
   defaultReward: bigint
@@ -69,19 +73,36 @@ interface ProofEvent {
 }
 
 /**
- * Resolves the sequencer reward of each checkpoint through the rollup's
- * on-chain calculator.
+ * The gas limit an `eth_call` needs so the callee receives exactly `stipend`
+ * gas: the limit pays intrinsic gas and calldata gas first, and only the
+ * remainder is forwarded. The rollup's `staticcall` forwards the whole stipend,
+ * so without this the modelled call would be stingier than the chain's.
+ */
+export function ethCallGasLimit(data: Hex, stipend: bigint): bigint {
+  let zeroBytes = 0n
+  let nonzeroBytes = 0n
+  for (let i = 2; i < data.length; i += 2) {
+    if (data.slice(i, i + 2) === "00") zeroBytes++
+    else nonzeroBytes++
+  }
+  return 21_000n + 4n * zeroBytes + 16n * nonzeroBytes + stipend
+}
+
+/**
+ * Resolves the sequencer reward of every checkpoint in the window through the
+ * rollup's on-chain calculator.
  *
  * Rewards are read where the protocol reads them: at the L1 block where the
  * epoch proof landed, one `getSequencerRewards` call per proof, with the
- * checkpoint's proposer as the single entry. The reference
- * `RegistryReductionCalculator` decides each proposer independently, so a
- * one-entry call reproduces the rollup's per-checkpoint value; a calculator
- * that depended on the whole array would not reconcile against the counter and
- * the caller refuses the run.
+ * proposers of all newly proven checkpoints in checkpoint order. `eth_call`
+ * executes against end-of-block state, so a calculator whose inputs change
+ * later in the same block would be modelled against state the chain never
+ * used; the run refuses a window where the calculator emits any event in a
+ * paying proof's block. Changes that emit no event remain a known limitation —
+ * only a trace of the paying proof tx can reproduce those exactly.
  *
- * A reverting or empty-returning calculator is mirrored exactly as the rollup
- * behaves: every checkpoint of that proof falls back to `defaultReward`.
+ * A calculator call that reverts or runs out of the stipend pays the default
+ * for that proof, exactly as `SequencerRewardCalculatorLib` does on-chain.
  * Transport failures are rethrown — they are not protocol outcomes.
  */
 export async function readCalculatorRewards(input: CalculatorRewardInput): Promise<Map<bigint, bigint>> {
@@ -110,6 +131,8 @@ export async function readCalculatorRewards(input: CalculatorRewardInput): Promi
   }
 
   const proofByIndex = new Map(proofs.map((p) => [p.index, p]))
+  await refuseOnSameBlockCalculatorEvents(input, new Set([...groups.keys()].map((i) => proofByIndex.get(i)!.blockNumber)))
+
   const entries = [...groups.entries()]
   const resolved = await mapWithConcurrency(entries, 4, async ([index, checkpoints]) => {
     const proof = proofByIndex.get(index)!
@@ -145,7 +168,7 @@ async function readOneProof(
 
   const proposers = checkpoints.map((c) => c.proposer)
   const defaults = checkpoints.map(() => input.defaultReward)
-
+  const stipend = CALCULATOR_GAS_BASE + CALCULATOR_GAS_PER_CHECKPOINT * BigInt(proposers.length)
   const data = encodeFunctionData({
     abi: CALCULATOR_ABI,
     functionName: "getSequencerRewards",
@@ -161,7 +184,7 @@ async function readOneProof(
             to: input.calculator,
             data,
             blockNumber: proofBlock,
-            gas: CALCULATOR_GAS_BASE + CALCULATOR_GAS_PER_CHECKPOINT * BigInt(proposers.length),
+            gas: ethCallGasLimit(data, stipend),
           })
         ).data,
       undefined,
@@ -169,8 +192,8 @@ async function readOneProof(
       input.retryMeter,
     )
   } catch (error) {
-    // The rollup pays the default when the calculator reverts or returns no
-    // data (SequencerRewardCalculatorLib rejects both, then falls back).
+    // The rollup pays the default when the calculator reverts or exhausts its
+    // stipend (SequencerRewardCalculatorLib rejects both, then falls back).
     if (isCalculatorFallback(error)) return defaults
     throw error
   }
@@ -192,6 +215,35 @@ async function readOneProof(
     if (reward > MAX_SEQUENCER_REWARD_PER_CHECKPOINT) return defaults
   }
   return [...rewards]
+}
+
+/**
+ * `eth_call` executes against end-of-block state, but the rollup's staticcall
+ * runs at the proof tx's position mid-block. If the calculator emits anything
+ * in a paying proof's block, its configuration may have changed after the
+ * proof used it, so refuse the window instead of modelling against state the
+ * chain never read.
+ */
+async function refuseOnSameBlockCalculatorEvents(input: CalculatorRewardInput, proofBlocks: ReadonlySet<bigint>) {
+  if (proofBlocks.size === 0) return
+  for (let from = input.fromBlock + 1n; from <= input.toBlock; from += input.logChunkSize) {
+    const to = from + input.logChunkSize - 1n < input.toBlock ? from + input.logChunkSize - 1n : input.toBlock
+    const logs = await withRetry(
+      () => input.client.getLogs({ address: input.calculator, fromBlock: from, toBlock: to }),
+      undefined,
+      undefined,
+      input.retryMeter,
+    )
+    for (const log of logs) {
+      if (log.blockNumber !== null && proofBlocks.has(log.blockNumber)) {
+        throw new Error(
+          `Sequencer reward calculator ${input.calculator} emitted an event in block ${log.blockNumber}, ` +
+            `the same block as an epoch proof paying this window. Its per-checkpoint rewards cannot be ` +
+            `reproduced from end-of-block state; split the settlement at that change.`,
+        )
+      }
+    }
+  }
 }
 
 async function readProofEvents(input: CalculatorRewardInput): Promise<ProofEvent[]> {
@@ -222,14 +274,27 @@ async function readProofEvents(input: CalculatorRewardInput): Promise<ProofEvent
 }
 
 /**
- * True when the calculator call failed the way the rollup also treats as
- * "pay the default": an EVM revert or an empty response.
+ * True when the calculator call failed the way the rollup also treats as "pay
+ * the default": an EVM revert, or a call that exhausted its stipend.
+ *
+ * `client.call` (unlike `readContract`) surfaces these as `CallExecutionError`
+ * with `ExecutionRevertedError` in the cause chain — viem maps both
+ * "execution reverted" and geth's "gas required exceeds allowance" wording to
+ * that class. Nodes that word an out-of-gas `eth_call` differently surface it
+ * as `InvalidInputRpcError` with the node message on the cause chain.
  */
 function isCalculatorFallback(error: unknown): boolean {
   if (!(error instanceof BaseError)) return false
+  if (error.walk((e) => e instanceof ExecutionRevertedError) !== null) return true
+  let invalidInput = false
+  error.walk((e) => {
+    if (e instanceof InvalidInputRpcError) invalidInput = true
+    return false
+  })
+  if (!invalidInput) return false
   return (
-    error.walk(
-      (e) => e instanceof ContractFunctionRevertedError || e instanceof ContractFunctionZeroDataError,
-    ) !== null
+    error.walk((e) => e instanceof Error && NODE_OUT_OF_GAS.test(e.message)) !== null
   )
 }
+
+const NODE_OUT_OF_GAS = /out of gas|gas required exceeds allowance|intrinsic gas too low/i

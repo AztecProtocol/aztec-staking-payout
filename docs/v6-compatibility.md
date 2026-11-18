@@ -21,15 +21,23 @@ byte for byte. This is a source comparison, not an independent bytecode audit.
   RewardLib deducts `manaUsed * protocolFee`, then caps the prover payment to
   the remaining fees. The deduction goes to a protocol recipient, not a burn.
 - V6 optionally supports a sequencer reward calculator. The runner resolves a
-  non-zero `getSequencerRewardCalculator()` per checkpoint, at the L1 block
-  where that checkpoint's epoch proof landed, and reconciles the resulting
-  amounts against the same counter delta as before. It still refuses a
-  calculator that is replaced inside the window, and it pays the default reward
-  for a proof whose calculator call reverts or returns malformed data, matching
-  `SequencerRewardCalculatorLib`. Resolution assumes the calculator's value for
-  a checkpoint depends only on that checkpoint's epoch and proposer (true for
-  the reference `RegistryReductionCalculator`); a calculator that depends on the
-  whole proposer array will not reconcile and the run stops. Counter
+  non-zero `getSequencerRewardCalculator()` per epoch proof: it replays
+  `getSequencerRewards(epoch, proposers, defaultReward, checkpointReward)` at
+  the L1 block where that proof landed, with every newly proven proposer of the
+  proof — all providers, in checkpoint order, not just this operator's subset —
+  and with the callee receiving exactly the rollup's stipend (the `eth_call`
+  limit adds intrinsic + calldata gas on top of `200_000 + 100_000 * n`). The
+  resolved amounts feed the same counter reconciliation as before. The run
+  still refuses a calculator that is replaced inside the window or that emits
+  an event in a paying proof's block (end-of-block `eth_call` state cannot
+  reproduce a mid-block change), and pays the default for a proof whose call
+  reverts, exhausts its stipend, or returns malformed data, matching
+  `SequencerRewardCalculatorLib`. Two gaps remain by design: a calculator
+  whose inputs change in the proof's block *without* emitting an event is only
+  caught when it moves the wallet total, and escape-hatch epochs pay the
+  default on-chain while the tool still asks the calculator — both stop the
+  run via reconciliation rather than estimating. A trace of the paying proof
+  transaction would close the first gap and is the intended follow-up. Counter
   reconciliation, reward-config change detection, finalized complete epochs and
   all beneficiary gates still apply.
 

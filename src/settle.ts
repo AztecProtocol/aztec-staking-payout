@@ -20,7 +20,7 @@ import {
   type DiscoveredDelegator,
   type DuplicateKeyResolution,
 } from "./discovery.js"
-import { countProposalsByProposer } from "./proposals.js"
+import { countProposalsByProposer, type AttributedCheckpoint } from "./proposals.js"
 import { readCheckpointRewards, buildRewardDistribution, reconcileRewards, type PayableCheckpoint, type CheckpointReward, type RewardReconciliation } from "./rewards.js"
 import { readCalculatorRewards, GET_CALCULATOR_ABI } from "./calculator.js"
 import { withRetry } from "./concurrency.js"
@@ -469,6 +469,10 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   let oursProposed = 0
   let attributedCheckpoints: AuditRecord["attributedCheckpoints"]
   const rewardCheckpoints: PayableCheckpoint[] = []
+  /** Every checkpoint in the window — all providers, all coinbases. The rollup
+   *  passes all of a proof's newly proven proposers to the calculator, so the
+   *  calculator call must be built from this list, not from our subset. */
+  let allWindowCheckpoints: AttributedCheckpoint[] = []
   let checkpointRewards: CheckpointReward[] = []
   let rewardReconciliation: RewardReconciliation | undefined
   if (ignoreCoinbase && !manualOverride) throw new Error("--ignore-coinbase requires --simulate-reward; real payouts must reconcile the distribution wallet")
@@ -504,6 +508,7 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     } finally {
       progress.done()
     }
+    allWindowCheckpoints = counts.attributed
 
     // Walk the attributed-checkpoint trail once. A checkpoint is counted
     // toward the reward only when (a) its proposer is one of the operator's
@@ -686,12 +691,12 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
         console.log(`▸ Sequencer reward calculator @${fromBlock}: ${onchain} — resolving per-checkpoint rewards…`)
         rewardByCheckpoint = await readCalculatorRewards({
           client: publicClient, rollupAddress: config.rollupAddress, calculator: onchain,
-          checkpoints: rewardCheckpoints, defaultReward: sequencerRewardPerCheckpoint,
+          checkpoints: allWindowCheckpoints, defaultReward: sequencerRewardPerCheckpoint,
           checkpointReward: rewardConfig.checkpointReward, fromBlock, toBlock,
           logChunkSize: config.logChunkSize, retryMeter: meter,
         })
         const reduced = [...rewardByCheckpoint.values()]
-          .filter((reward) => reward !== sequencerRewardPerCheckpoint).length
+          .filter((reward) => reward < sequencerRewardPerCheckpoint).length
         console.log(
           `▸ Calculator rewards: ${reduced} of ${rewardCheckpoints.length} checkpoint(s) below the ` +
             `${fmt(sequencerRewardPerCheckpoint)} default`,
