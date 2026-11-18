@@ -14,6 +14,9 @@ export interface AuditRecord {
   calculationVersion?: 2
   rollup?: Address
   chainId?: number
+  /** Non-zero v6 sequencer reward calculator whose per-checkpoint rewards were
+   *  used. Absent when the rollup paid the flat default reward. */
+  sequencerRewardCalculator?: Address
   rewardReconciliation?: {
     counterBefore: string; counterAfter: string; claimedInWindow: string
     measuredAccrual: string; modeledAccrual: string

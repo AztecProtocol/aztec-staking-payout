@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { type Address, type Hex } from "viem"
+import { encodeFunctionResult, type Address, type Hex } from "viem"
+import { CALCULATOR_ABI } from "./calculator.js"
 import { settle, type SettleOptions } from "./settle.js"
 import { makePublicClient } from "./client.js"
 import { resolveEpochRange } from "./epochs.js"
@@ -9,7 +10,7 @@ import { writeSafeImport } from "./calldata.js"
 import { writeAuditRecordToDisk } from "./audit.js"
 
 vi.mock("./client.js", () => ({ makePublicClient: vi.fn() }))
-vi.mock("./epochs.js", () => ({ resolveEpochRange: vi.fn() }))
+vi.mock("./epochs.js", async (original) => ({ ...await original<typeof import("./epochs.js")>(), resolveEpochRange: vi.fn() }))
 vi.mock("./discovery.js", async (original) => ({ ...await original<typeof import("./discovery.js")>(), discoverActiveDelegators: vi.fn() }))
 vi.mock("./proposals.js", () => ({ countProposalsByProposer: vi.fn() }))
 vi.mock("./gascost.js", () => ({ computeGasSpent: vi.fn(async () => ({ txCount: 2, totalGasUsed: 0n, totalEthSpentWei: 0n, weightedAvgGasPriceWei: 0n })) }))
@@ -32,19 +33,30 @@ describe("settlement export accuracy gates", () => {
   let measured: bigint
   let v6: boolean
   let calculator: Address
+  let calculatorRewards: bigint[]
+  let proofEvents: boolean
   beforeEach(() => {
     vi.clearAllMocks()
     vi.spyOn(console, "log").mockImplementation(() => {})
     measured = 800n
     v6 = false
     calculator = address(0)
+    calculatorRewards = [350n, 350n]
+    proofEvents = true
     const client = {
       getChainId: vi.fn(async () => 1),
       multicall: vi.fn(async () => [0, "TEST", address(8), { checkpointReward: 350n, sequencerBps: 10000 }].map((result) => ({ status: "success", result }))),
-      getLogs: vi.fn(async () => []),
+      getLogs: vi.fn(async (q: { event?: { name: string } }) =>
+        q.event?.name === "L2ProofVerified" && proofEvents
+          ? [{ blockNumber: 20n, args: { checkpointNumber: 2n } }]
+          : []),
+      call: vi.fn(async () => ({
+        data: encodeFunctionResult({ abi: CALCULATOR_ABI, functionName: "getSequencerRewards", result: calculatorRewards }),
+      })),
       readContract: vi.fn(async (q: { functionName: string; blockNumber?: bigint }) => {
         if (q.functionName === "getFeeHeader") return { manaUsed: 0n, congestionCost: 0n, protocolFee: 0n, proverCost: 0n }
         if (q.functionName === "getSequencerRewardCalculator") return calculator
+        if (q.functionName === "getEpochForCheckpoint") return 1n
         if (q.functionName === "getSequencerRewards") return q.blockNumber === 10n ? 0n : measured
         if (q.functionName === "balanceOf") return 1000n
         throw new Error(`Unexpected read ${q.functionName}`)
@@ -90,10 +102,29 @@ describe("settlement export accuracy gates", () => {
     expect(result.audit.rewardReconciliation).toMatchObject({ measuredAccrual: "800", modeledAccrual: "800" })
   })
 
-  it("writes no v6 payout with a custom calculator even when aggregate earnings reconcile", async () => {
+  it("models a custom v6 calculator and records it in the audit", async () => {
     v6 = true
     calculator = address(99)
-    await expect(settle(opts)).rejects.toThrow(/Non-default v6/)
+    const result = await settle(opts)
+    expect(result.audit.sequencerRewardCalculator).toBe(address(99))
+    expect(result.audit.rewardReconciliation).toMatchObject({ measuredAccrual: "800", modeledAccrual: "800" })
+    expect(result.plan?.entries.map((r) => [r.delegator, r.amount])).toEqual([[alice, 337n], [bob, 262n]])
+  })
+
+  it("applies a below-default calculator reward to the checkpoint's beneficiary", async () => {
+    v6 = true
+    calculator = address(99)
+    calculatorRewards = [0n, 350n]
+    measured = 450n // 100 fee + 0 reward, then 350 reward
+    const result = await settle(opts)
+    expect(result.plan?.entries.map((r) => [r.delegator, r.amount])).toEqual([[alice, 75n], [bob, 262n]])
+  })
+
+  it("refuses a calculator run whose proof blocks cannot be resolved", async () => {
+    v6 = true
+    calculator = address(99)
+    proofEvents = false
+    await expect(settle(opts)).rejects.toThrow(/No L2ProofVerified event covers checkpoint/)
     expect(writeSafeImport).not.toHaveBeenCalled()
     expect(writeAuditRecordToDisk).not.toHaveBeenCalled()
   })

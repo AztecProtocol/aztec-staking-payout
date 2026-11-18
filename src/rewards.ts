@@ -39,6 +39,10 @@ export function netSequencerFee(accumulatedFees: bigint, header: {
 export async function readCheckpointRewards(input: {
   client: PublicClient; rollupAddress: Address; checkpoints: readonly PayableCheckpoint[];
   sequencerRewardPerCheckpoint: bigint; retryMeter?: { retries: number }
+  /** Per-checkpoint sequencer rewards resolved from the rollup's v6
+   *  calculator. When present it is authoritative: a missing checkpoint is an
+   *  error, never an implicit default. */
+  rewardByCheckpoint?: ReadonlyMap<bigint, bigint>
 }): Promise<CheckpointReward[]> {
   return mapWithConcurrency(input.checkpoints, 12, async (c) => {
     if (c.accumulatedFees === undefined) {
@@ -60,8 +64,19 @@ export async function readCheckpointRewards(input: {
         }), undefined, undefined, input.retryMeter))
       }
     }
-    return { ...c, sequencerFee, fixedReward: input.sequencerRewardPerCheckpoint,
-      grossReward: input.sequencerRewardPerCheckpoint + sequencerFee }
+    let fixedReward = input.sequencerRewardPerCheckpoint
+    if (input.rewardByCheckpoint) {
+      const resolved = input.rewardByCheckpoint.get(c.checkpointNumber)
+      if (resolved === undefined) {
+        throw new Error(
+          `No calculator reward resolved for checkpoint ${c.checkpointNumber}; ` +
+            `refusing to assume the default reward for a calculator-modelled window`,
+        )
+      }
+      fixedReward = resolved
+    }
+    return { ...c, sequencerFee, fixedReward,
+      grossReward: fixedReward + sequencerFee }
   })
 }
 
@@ -144,8 +159,12 @@ export function assertRewardReconciliation(before: bigint, after: bigint, claims
 export async function reconcileRewards(input: {
   client: PublicClient; rollupAddress: Address; tokenAddress: Address; distributionWalletAddress: Address;
   fromBlock: bigint; toBlock: bigint; logChunkSize: bigint; modeledAccrual: bigint; retryMeter?: { retries: number }
-  /** v6 calculators may redistribute fixed rewards between checkpoints, even if their sum reconciles. */
+  /** Require the default (zero-address) v6 calculator: the flat per-checkpoint model is only valid then. */
   requireDefaultV6Rewards?: boolean
+  /** Non-zero calculator whose per-checkpoint rewards were modelled. Its address
+   *  must still be in effect at `fromBlock`, and it must not be replaced inside
+   *  the window. */
+  calculator?: Address
 }): Promise<RewardReconciliation> {
   const { client, rollupAddress, distributionWalletAddress, retryMeter } = input
   const read = (blockNumber: bigint) => withRetry(() => client.readContract({
@@ -153,11 +172,17 @@ export async function reconcileRewards(input: {
     args: [distributionWalletAddress], blockNumber,
   }), undefined, undefined, retryMeter)
   const [counterBefore, counterAfter] = await Promise.all([read(input.fromBlock), read(input.toBlock)])
-  if (input.requireDefaultV6Rewards) {
-    const calculator = await withRetry(() => client.readContract({ address: rollupAddress,
+  if (input.calculator || input.requireDefaultV6Rewards) {
+    const onchain = await withRetry(() => client.readContract({ address: rollupAddress,
       abi: CALCULATOR_ABI, functionName: "getSequencerRewardCalculator", blockNumber: input.fromBlock,
     }), undefined, undefined, retryMeter)
-    if (calculator.toLowerCase() !== "0x0000000000000000000000000000000000000000") {
+    if (input.calculator && onchain.toLowerCase() !== input.calculator.toLowerCase()) {
+      throw new Error(
+        `Modelled calculator ${input.calculator} is not the calculator in effect at block ` +
+          `${input.fromBlock} (${onchain}); refusing to reconcile against a different calculator`,
+      )
+    }
+    if (!input.calculator && onchain.toLowerCase() !== "0x0000000000000000000000000000000000000000") {
       throw new Error("Non-default v6 sequencer reward calculator; cannot safely attribute fixed checkpoint rewards")
     }
   }
@@ -172,10 +197,10 @@ export async function reconcileRewards(input: {
       withRetry(() => client.getLogs({ address: rollupAddress, event: CONFIG_CHANGED, fromBlock, toBlock }), undefined, undefined, retryMeter),
     ])
     if (changes.length) throw new Error("Reward configuration changed within the window; split the settlement at that change")
-    if (input.requireDefaultV6Rewards) {
+    if (input.calculator || input.requireDefaultV6Rewards) {
       const calculatorChanges = await withRetry(() => client.getLogs({ address: rollupAddress,
         event: CALCULATOR_CHANGED, fromBlock, toBlock }), undefined, undefined, retryMeter)
-      if (calculatorChanges.length) throw new Error("Sequencer reward calculator changed within the window; refusing an approximate v6 payout")
+      if (calculatorChanges.length) throw new Error("Sequencer reward calculator changed within the window; refusing to mix calculator and default rewards")
     }
     for (const log of transfers) {
       if (log.args.value === undefined || log.blockNumber === null || !log.transactionHash) throw new Error("Incomplete reward transfer log")
