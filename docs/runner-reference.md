@@ -5,7 +5,7 @@ The runner reconstructs each beneficiary's checkpoint earnings, subtracts the co
 ## Quick start
 
 ```bash
-nvm install   # Node 24.22.1, pinned in .nvmrc
+nvm install   # Node 24.22.3, pinned in .nvmrc
 nvm use
 npm ci
 npm test
