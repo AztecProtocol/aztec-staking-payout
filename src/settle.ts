@@ -22,7 +22,7 @@ import {
 } from "./discovery.js"
 import { countProposalsByProposer, type AttributedCheckpoint } from "./proposals.js"
 import { readCheckpointRewards, buildRewardDistribution, reconcileRewards, type PayableCheckpoint, type CheckpointReward, type RewardReconciliation } from "./rewards.js"
-import { readCalculatorRewards, GET_CALCULATOR_ABI } from "./calculator.js"
+import { readCalculatorRewards, readCalculatorTimeline, ZERO_ADDRESS, type CalculatorTimeline } from "./calculator.js"
 import { withRetry } from "./concurrency.js"
 import { computeGasSpent } from "./gascost.js"
 import { resolveEpochRange, type EpochRange } from "./epochs.js"
@@ -667,30 +667,37 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
   // Attribute each checkpoint's actual net earnings before applying commission.
   // The independent counter/claims gate must succeed even when the modeled amount is zero.
   let rewardEarned: bigint
-  /** Non-zero v6 calculator whose per-checkpoint rewards were modelled. */
-  let sequencerRewardCalculator: Address | undefined
+  /** Calculator state the rewards were modelled against, when any calculator
+   *  (or transition between calculators) was in effect during the window. */
+  let calculatorTimeline: CalculatorTimeline | undefined
   if (manualOverride) {
     rewardEarned = simulateReward!
     console.log(`▸ Reward (manual override): ${fmt(rewardEarned)}`)
   } else {
     // A governance-set v6 calculator may pay each newly proven checkpoint a
     // different sequencer reward (the reference calculator reduces insider
-    // registries). Resolve it at the proof blocks the rewards landed at, and
-    // model those values instead of the flat per-checkpoint default.
+    // registries). Resolve each proof against the calculator in effect at the
+    // block where that proof landed — including across an install or removal
+    // mid-window — and model those values instead of the flat per-checkpoint
+    // default.
     const hasV6Checkpoints = rewardCheckpoints.some((c) => c.proposalVersion === "v6")
-    let calculator: Address | undefined
     let rewardByCheckpoint: Map<bigint, bigint> | undefined
     if (hasV6Checkpoints) {
-      const onchain = await withRetry(() => publicClient.readContract({
-        address: config.rollupAddress, abi: GET_CALCULATOR_ABI,
-        functionName: "getSequencerRewardCalculator", blockNumber: fromBlock,
-      }), undefined, undefined, meter)
-      if (onchain.toLowerCase() !== "0x0000000000000000000000000000000000000000") {
-        calculator = onchain
-        sequencerRewardCalculator = onchain
-        console.log(`▸ Sequencer reward calculator @${fromBlock}: ${onchain} — resolving per-checkpoint rewards…`)
+      const timeline = await readCalculatorTimeline({
+        client: publicClient, rollupAddress: config.rollupAddress,
+        fromBlock, toBlock, logChunkSize: config.logChunkSize, retryMeter: meter,
+      })
+      const modelled = timeline.initial.toLowerCase() !== ZERO_ADDRESS || timeline.changes.length > 0
+      if (modelled) {
+        calculatorTimeline = timeline
+        const trail = [
+          timeline.initial.toLowerCase() === ZERO_ADDRESS ? "default" : timeline.initial,
+          ...timeline.changes.map((c) =>
+            `${c.newCalculator.toLowerCase() === ZERO_ADDRESS ? "default" : c.newCalculator} @ ${c.blockNumber}`),
+        ].join(" → ")
+        console.log(`▸ Sequencer reward calculator: ${trail} — resolving per-checkpoint rewards…`)
         rewardByCheckpoint = await readCalculatorRewards({
-          client: publicClient, rollupAddress: config.rollupAddress, calculator: onchain,
+          client: publicClient, rollupAddress: config.rollupAddress, timeline,
           checkpoints: allWindowCheckpoints, defaultReward: sequencerRewardPerCheckpoint,
           checkpointReward: rewardConfig.checkpointReward, fromBlock, toBlock,
           logChunkSize: config.logChunkSize, retryMeter: meter,
@@ -711,8 +718,8 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     rewardEarned = checkpointRewards.reduce((sum, c) => sum + c.grossReward, 0n)
     rewardReconciliation = await reconcileRewards({
       client: publicClient, ...config, fromBlock, toBlock, modeledAccrual: rewardEarned, retryMeter: meter,
-      requireDefaultV6Rewards: hasV6Checkpoints && !calculator,
-      ...(calculator ? { calculator } : {}),
+      requireDefaultV6Rewards: hasV6Checkpoints && !calculatorTimeline,
+      ...(calculatorTimeline ? { modelledCalculatorTimeline: calculatorTimeline } : {}),
     })
     const byCheckpoint = new Map(checkpointRewards.map((c) => [c.checkpointNumber.toString(), c]))
     for (const c of attributedCheckpoints ?? []) {
@@ -993,7 +1000,14 @@ export async function settle(opts: SettleOptions): Promise<SettleResult> {
     calculationVersion: 2,
     rollup: config.rollupAddress,
     chainId,
-    ...(sequencerRewardCalculator ? { sequencerRewardCalculator } : {}),
+    ...(calculatorTimeline ? {
+      sequencerRewardCalculator: calculatorTimeline.initial,
+      ...(calculatorTimeline.changes.length > 0 ? {
+        sequencerRewardCalculatorChanges: calculatorTimeline.changes.map((c) => ({
+          blockNumber: c.blockNumber.toString(), oldCalculator: c.oldCalculator, newCalculator: c.newCalculator,
+        })),
+      } : {}),
+    } : {}),
     ...(rewardReconciliation ? { rewardReconciliation: {
       counterBefore: rewardReconciliation.counterBefore.toString(),
       counterAfter: rewardReconciliation.counterAfter.toString(),

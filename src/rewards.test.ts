@@ -94,10 +94,21 @@ describe("independent reward reconciliation", () => {
     expect(isSequencerClaim(bob, encodeFunctionData({ abi: multiAbi, functionName: "multiSend", args: ["0x00"] }), rollup, wallet)).toBe(false)
   })
 
-  const fixture = (options: { badClaim?: boolean; configChanged?: boolean; calculator?: Address; calculatorChanged?: boolean } = {}) => {
+  const fixture = (options: {
+    badClaim?: boolean; configChanged?: boolean; calculator?: Address; calculatorChanged?: boolean
+    onChainChanges?: Array<{ blockNumber: bigint; oldCalculator: Address; newCalculator: Address }>
+  } = {}) => {
     const getLogs = vi.fn(async (q: { event: { name: string }; fromBlock: bigint; toBlock: bigint }) => {
       if (q.event.name === "RewardConfigUpdated") return options.configChanged ? [{}] : []
-      if (q.event.name === "SequencerRewardCalculatorUpdated") return options.calculatorChanged ? [{}] : []
+      if (q.event.name === "SequencerRewardCalculatorUpdated") {
+        const changes = options.onChainChanges
+          ?? (options.calculatorChanged
+            ? [{ blockNumber: 12n, oldCalculator: "0x0000000000000000000000000000000000000000" as Address, newCalculator: alice }]
+            : [])
+        return changes
+          .filter((c) => c.blockNumber >= q.fromBlock && c.blockNumber <= q.toBlock)
+          .map((c) => ({ blockNumber: c.blockNumber, args: { oldCalculator: c.oldCalculator, newCalculator: c.newCalculator } }))
+      }
       return q.fromBlock <= 12n && q.toBlock >= 12n ? [{ args: { value: 400n }, blockNumber: 12n, transactionHash: hash }] : []
     })
     const client = { getLogs,
@@ -130,13 +141,48 @@ describe("independent reward reconciliation", () => {
     await expect(reconcileRewards({ ...fixture({ calculator: alice }).input, requireDefaultV6Rewards: true }))
       .rejects.toThrow(/Non-default v6/)
     // Modelled calculator: reconciliation proceeds against the real counter.
-    expect(await reconcileRewards({ ...fixture({ calculator: alice }).input, calculator: alice }))
+    expect(await reconcileRewards({ ...fixture({ calculator: alice }).input, modelledCalculatorTimeline: { initial: alice, changes: [] } }))
       .toMatchObject({ measuredAccrual: 350n })
     // A different calculator in effect at fromBlock is not what was modelled.
-    await expect(reconcileRewards({ ...fixture({ calculator: bob }).input, calculator: alice }))
+    await expect(reconcileRewards({ ...fixture({ calculator: bob }).input, modelledCalculatorTimeline: { initial: alice, changes: [] } }))
       .rejects.toThrow(/not the calculator in effect/)
-    // Replacement inside the window mixes two policies.
-    await expect(reconcileRewards({ ...fixture({ calculator: alice, calculatorChanged: true }).input, calculator: alice }))
+    // Replacement inside the window, not modelled, mixes two policies.
+    await expect(reconcileRewards({ ...fixture({ calculatorChanged: true }).input, requireDefaultV6Rewards: true }))
       .rejects.toThrow(/calculator changed/)
+  })
+
+  it("reconciles a modelled transition and refuses one that does not match the chain", async () => {
+    // The chain installs `alice` at block 13; the model says the same.
+    const onChainChanges = [{ blockNumber: 13n, oldCalculator: "0x0000000000000000000000000000000000000000" as Address, newCalculator: alice }]
+    const transition = {
+      initial: "0x0000000000000000000000000000000000000000" as Address,
+      changes: onChainChanges,
+    }
+    expect(await reconcileRewards({
+      ...fixture({ onChainChanges }).input,
+      modelledCalculatorTimeline: transition,
+    })).toMatchObject({ measuredAccrual: 350n })
+
+    // A change on the chain the model does not know about fails.
+    await expect(reconcileRewards({
+      ...fixture({ onChainChanges }).input,
+      modelledCalculatorTimeline: { initial: transition.initial, changes: [] },
+    })).rejects.toThrow(/do not match the modelled timeline/)
+
+    // A modelled change that did not actually happen fails.
+    await expect(reconcileRewards({
+      ...fixture().input,
+      modelledCalculatorTimeline: transition,
+    })).rejects.toThrow(/do not match the modelled timeline/)
+
+    // A change at a different block, or to a different calculator, fails.
+    await expect(reconcileRewards({
+      ...fixture({ onChainChanges }).input,
+      modelledCalculatorTimeline: { ...transition, changes: [{ ...onChainChanges[0]!, blockNumber: 14n }] },
+    })).rejects.toThrow(/do not match the modelled timeline/)
+    await expect(reconcileRewards({
+      ...fixture({ onChainChanges }).input,
+      modelledCalculatorTimeline: { ...transition, changes: [{ ...onChainChanges[0]!, newCalculator: bob }] },
+    })).rejects.toThrow(/do not match the modelled timeline/)
   })
 })

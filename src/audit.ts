@@ -14,9 +14,18 @@ export interface AuditRecord {
   calculationVersion?: 2
   rollup?: Address
   chainId?: number
-  /** Non-zero v6 sequencer reward calculator whose per-checkpoint rewards were
-   *  used. Absent when the rollup paid the flat default reward. */
+  /** v6 sequencer reward calculator in effect at `fromBlock`, when the window's
+   *  calculator state was modelled. Zero when the window began on the default
+   *  path and a calculator was installed mid-window (see
+   *  `sequencerRewardCalculatorChanges`). */
   sequencerRewardCalculator?: Address
+  /** Calculator transitions inside the window that were modelled, in block
+   *  order. Present only when the calculator changed mid-window. */
+  sequencerRewardCalculatorChanges?: Array<{
+    blockNumber: string
+    oldCalculator: Address
+    newCalculator: Address
+  }>
   rewardReconciliation?: {
     counterBefore: string; counterAfter: string; claimedInWindow: string
     measuredAccrual: string; modeledAccrual: string
