@@ -35,6 +35,10 @@ describe("settlement export accuracy gates", () => {
   let calculator: Address
   let calculatorRewards: bigint[]
   let proofEvents: boolean
+  /** Calculator in effect at a given block; default is "no calculator anywhere". */
+  let calcAt: (b: bigint) => Address
+  /** On-chain `SequencerRewardCalculatorUpdated` events in the window. */
+  let onChainChanges: Array<{ blockNumber: bigint; oldCalculator: Address; newCalculator: Address }>
   beforeEach(() => {
     vi.clearAllMocks()
     vi.spyOn(console, "log").mockImplementation(() => {})
@@ -43,19 +47,28 @@ describe("settlement export accuracy gates", () => {
     calculator = address(0)
     calculatorRewards = [350n, 350n]
     proofEvents = true
+    calcAt = () => address(0)
+    onChainChanges = []
     const client = {
       getChainId: vi.fn(async () => 1),
       multicall: vi.fn(async () => [0, "TEST", address(8), { checkpointReward: 350n, sequencerBps: 10000 }].map((result) => ({ status: "success", result }))),
-      getLogs: vi.fn(async (q: { event?: { name: string } }) =>
-        q.event?.name === "L2ProofVerified" && proofEvents
-          ? [{ blockNumber: 20n, args: { checkpointNumber: 2n } }]
-          : []),
+      getLogs: vi.fn(async (q: { address?: Address; event?: { name: string }; fromBlock?: bigint; toBlock?: bigint }) => {
+        if (q.event?.name === "L2ProofVerified" && proofEvents) {
+          return [{ blockNumber: 20n, args: { checkpointNumber: 2n } }]
+        }
+        if (q.event?.name === "SequencerRewardCalculatorUpdated" && q.fromBlock !== undefined && q.toBlock !== undefined) {
+          return onChainChanges
+            .filter((c) => c.blockNumber >= q.fromBlock! && c.blockNumber <= q.toBlock!)
+            .map((c) => ({ blockNumber: c.blockNumber, args: { oldCalculator: c.oldCalculator, newCalculator: c.newCalculator } }))
+        }
+        return []
+      }),
       call: vi.fn(async () => ({
         data: encodeFunctionResult({ abi: CALCULATOR_ABI, functionName: "getSequencerRewards", result: calculatorRewards }),
       })),
       readContract: vi.fn(async (q: { functionName: string; blockNumber?: bigint }) => {
         if (q.functionName === "getFeeHeader") return { manaUsed: 0n, congestionCost: 0n, protocolFee: 0n, proverCost: 0n }
-        if (q.functionName === "getSequencerRewardCalculator") return calculator
+        if (q.functionName === "getSequencerRewardCalculator") return calcAt(q.blockNumber ?? 0n)
         if (q.functionName === "getEpochForCheckpoint") return 1n
         if (q.functionName === "getSequencerRewards") return q.blockNumber === 10n ? 0n : measured
         if (q.functionName === "balanceOf") return 1000n
@@ -104,16 +117,32 @@ describe("settlement export accuracy gates", () => {
 
   it("models a custom v6 calculator and records it in the audit", async () => {
     v6 = true
-    calculator = address(99)
+    calcAt = () => address(99)
     const result = await settle(opts)
     expect(result.audit.sequencerRewardCalculator).toBe(address(99))
+    expect(result.audit.sequencerRewardCalculatorChanges).toBeUndefined()
+    expect(result.audit.rewardReconciliation).toMatchObject({ measuredAccrual: "800", modeledAccrual: "800" })
+    expect(result.plan?.entries.map((r) => [r.delegator, r.amount])).toEqual([[alice, 337n], [bob, 262n]])
+  })
+
+  it("models a calculator installed mid-window and records the transition", async () => {
+    v6 = true
+    // Default at fromBlock (10); address(99) takes over at block 15; the single
+    // paying proof lands at block 20, after the change.
+    calcAt = (b) => (b >= 15n ? address(99) : address(0))
+    onChainChanges = [{ blockNumber: 15n, oldCalculator: address(0), newCalculator: address(99) }]
+    const result = await settle(opts)
+    expect(result.audit.sequencerRewardCalculator).toBe(address(0))
+    expect(result.audit.sequencerRewardCalculatorChanges).toEqual([
+      { blockNumber: "15", oldCalculator: address(0), newCalculator: address(99) },
+    ])
     expect(result.audit.rewardReconciliation).toMatchObject({ measuredAccrual: "800", modeledAccrual: "800" })
     expect(result.plan?.entries.map((r) => [r.delegator, r.amount])).toEqual([[alice, 337n], [bob, 262n]])
   })
 
   it("applies a below-default calculator reward to the checkpoint's beneficiary", async () => {
     v6 = true
-    calculator = address(99)
+    calcAt = () => address(99)
     calculatorRewards = [0n, 350n]
     measured = 450n // 100 fee + 0 reward, then 350 reward
     const result = await settle(opts)
@@ -122,9 +151,18 @@ describe("settlement export accuracy gates", () => {
 
   it("refuses a calculator run whose proof blocks cannot be resolved", async () => {
     v6 = true
-    calculator = address(99)
+    calcAt = () => address(99)
     proofEvents = false
     await expect(settle(opts)).rejects.toThrow(/No L2ProofVerified event covers checkpoint/)
+    expect(writeSafeImport).not.toHaveBeenCalled()
+    expect(writeAuditRecordToDisk).not.toHaveBeenCalled()
+  })
+
+  it("refuses a transition that happens in the same block as the paying proof", async () => {
+    v6 = true
+    calcAt = (b) => (b >= 20n ? address(99) : address(0))
+    onChainChanges = [{ blockNumber: 20n, oldCalculator: address(0), newCalculator: address(99) }]
+    await expect(settle(opts)).rejects.toThrow(/same block as an epoch proof paying this window/)
     expect(writeSafeImport).not.toHaveBeenCalled()
     expect(writeAuditRecordToDisk).not.toHaveBeenCalled()
   })

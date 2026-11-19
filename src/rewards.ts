@@ -2,6 +2,7 @@ import { decodeFunctionData, parseAbi, parseAbiItem, type Address, type Hex, typ
 import { mapWithConcurrency, withRetry } from "./concurrency.js"
 import type { AttributedCheckpoint } from "./proposals.js"
 import type { DistributionEntry } from "./types.js"
+import { CALCULATOR_CHANGED, scanCalculatorChanges, type CalculatorTimeline } from "./calculator.js"
 
 const FEE_HEADER_ABI = parseAbi([
   "function getFeeHeader(uint256) view returns ((uint256 excessMana,uint256 manaUsed,uint256 ethPerFeeAsset,uint256 congestionCost,uint256 proverCost))",
@@ -17,7 +18,6 @@ const AGGREGATE_ABI = parseAbi(["function aggregate3((address target,bool allowF
 const TRANSFER = parseAbiItem("event Transfer(address indexed from,address indexed to,uint256 value)")
 const CONFIG_CHANGED = parseAbiItem("event RewardConfigUpdated((uint32 sequencerBps,uint96 checkpointReward) rewardConfig)")
 const CALCULATOR_ABI = parseAbi(["function getSequencerRewardCalculator() view returns (address)"])
-const CALCULATOR_CHANGED = parseAbiItem("event SequencerRewardCalculatorUpdated(address oldCalculator,address newCalculator)")
 
 export interface PayableCheckpoint extends AttributedCheckpoint { delegator: Address }
 export interface CheckpointReward extends PayableCheckpoint {
@@ -161,10 +161,11 @@ export async function reconcileRewards(input: {
   fromBlock: bigint; toBlock: bigint; logChunkSize: bigint; modeledAccrual: bigint; retryMeter?: { retries: number }
   /** Require the default (zero-address) v6 calculator: the flat per-checkpoint model is only valid then. */
   requireDefaultV6Rewards?: boolean
-  /** Non-zero calculator whose per-checkpoint rewards were modelled. Its address
-   *  must still be in effect at `fromBlock`, and it must not be replaced inside
-   *  the window. */
-  calculator?: Address
+  /** Calculator timeline the rewards were modelled against. The calculator in
+   *  effect at `fromBlock` and every change event in the window must match it
+   *  exactly, so a transition that was not modelled — or one that drifted —
+   *  fails reconciliation. */
+  modelledCalculatorTimeline?: CalculatorTimeline
 }): Promise<RewardReconciliation> {
   const { client, rollupAddress, distributionWalletAddress, retryMeter } = input
   const read = (blockNumber: bigint) => withRetry(() => client.readContract({
@@ -172,17 +173,34 @@ export async function reconcileRewards(input: {
     args: [distributionWalletAddress], blockNumber,
   }), undefined, undefined, retryMeter)
   const [counterBefore, counterAfter] = await Promise.all([read(input.fromBlock), read(input.toBlock)])
-  if (input.calculator || input.requireDefaultV6Rewards) {
+  if (input.modelledCalculatorTimeline || input.requireDefaultV6Rewards) {
+    const timeline = input.modelledCalculatorTimeline
     const onchain = await withRetry(() => client.readContract({ address: rollupAddress,
       abi: CALCULATOR_ABI, functionName: "getSequencerRewardCalculator", blockNumber: input.fromBlock,
     }), undefined, undefined, retryMeter)
-    if (input.calculator && onchain.toLowerCase() !== input.calculator.toLowerCase()) {
-      throw new Error(
-        `Modelled calculator ${input.calculator} is not the calculator in effect at block ` +
-          `${input.fromBlock} (${onchain}); refusing to reconcile against a different calculator`,
-      )
-    }
-    if (!input.calculator && onchain.toLowerCase() !== "0x0000000000000000000000000000000000000000") {
+    if (timeline) {
+      if (onchain.toLowerCase() !== timeline.initial.toLowerCase()) {
+        throw new Error(
+          `Modelled calculator ${timeline.initial} is not the calculator in effect at block ` +
+            `${input.fromBlock} (${onchain}); refusing to reconcile against a different calculator`,
+        )
+      }
+      const changes = await scanCalculatorChanges({
+        client, rollupAddress, fromBlock: input.fromBlock, toBlock: input.toBlock,
+        logChunkSize: input.logChunkSize, retryMeter,
+      })
+      const same = changes.length === timeline.changes.length
+        && changes.every((c, i) =>
+          c.blockNumber === timeline.changes[i]!.blockNumber
+          && c.oldCalculator.toLowerCase() === timeline.changes[i]!.oldCalculator.toLowerCase()
+          && c.newCalculator.toLowerCase() === timeline.changes[i]!.newCalculator.toLowerCase())
+      if (!same) {
+        throw new Error(
+          `On-chain sequencer reward calculator changes do not match the modelled timeline; ` +
+            `refusing to reconcile rewards resolved against a different calculator history`,
+        )
+      }
+    } else if (onchain.toLowerCase() !== "0x0000000000000000000000000000000000000000") {
       throw new Error("Non-default v6 sequencer reward calculator; cannot safely attribute fixed checkpoint rewards")
     }
   }
@@ -197,7 +215,7 @@ export async function reconcileRewards(input: {
       withRetry(() => client.getLogs({ address: rollupAddress, event: CONFIG_CHANGED, fromBlock, toBlock }), undefined, undefined, retryMeter),
     ])
     if (changes.length) throw new Error("Reward configuration changed within the window; split the settlement at that change")
-    if (input.calculator || input.requireDefaultV6Rewards) {
+    if (input.requireDefaultV6Rewards && !input.modelledCalculatorTimeline) {
       const calculatorChanges = await withRetry(() => client.getLogs({ address: rollupAddress,
         event: CALCULATOR_CHANGED, fromBlock, toBlock }), undefined, undefined, retryMeter)
       if (calculatorChanges.length) throw new Error("Sequencer reward calculator changed within the window; refusing to mix calculator and default rewards")

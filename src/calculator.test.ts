@@ -13,12 +13,17 @@ import {
   CALCULATOR_ABI,
   CALCULATOR_GAS_BASE,
   CALCULATOR_GAS_PER_CHECKPOINT,
+  calculatorInEffectAt,
   ethCallGasLimit,
   readCalculatorRewards,
+  scanCalculatorChanges,
+  ZERO_ADDRESS,
+  type CalculatorTimeline,
 } from "./calculator.js"
 
 const rollup = "0x0000000000000000000000000000000000000022" as Address
 const calculator = "0x0000000000000000000000000000000000000033" as Address
+const replacement = "0x0000000000000000000000000000000000000077" as Address
 const alice = "0x0000000000000000000000000000000000000044" as Address
 const bob = "0x0000000000000000000000000000000000000055" as Address
 const carol = "0x0000000000000000000000000000000000000066" as Address
@@ -29,6 +34,12 @@ const checkpoint = (checkpointNumber: bigint, blockNumber: bigint, proposer: Add
   checkpointNumber, blockNumber, proposer, coinbase: "0x0000000000000000000000000000000000000099" as Address,
   logIndex: 0, txHash: hash,
 })
+
+const stableTimeline: CalculatorTimeline = { initial: calculator, changes: [] }
+const installTimeline: CalculatorTimeline = {
+  initial: ZERO_ADDRESS as Address,
+  changes: [{ blockNumber: 105n, oldCalculator: ZERO_ADDRESS as Address, newCalculator: calculator }],
+}
 
 /** Errors as viem's `client.call` actually throws them, not as `readContract` does. */
 const reverted = () => new CallExecutionError(
@@ -70,8 +81,8 @@ function fixture(options: {
   return { client, getLogs, readContract, call }
 }
 
-const baseInput = (client: PublicClient, checkpoints: ReturnType<typeof checkpoint>[]) => ({
-  client, rollupAddress: rollup, calculator,
+const baseInput = (client: PublicClient, checkpoints: ReturnType<typeof checkpoint>[], timeline: CalculatorTimeline) => ({
+  client, rollupAddress: rollup, timeline,
   checkpoints, defaultReward: DEFAULT, checkpointReward: 500n,
   fromBlock: 90n, toBlock: 200n, logChunkSize: 50n,
 })
@@ -85,7 +96,7 @@ describe("sequencer reward calculator", () => {
       proofs: [{ tip: 9n, block: 95n }, { tip: 12n, block: 120n }],
       rewards: (proposers) => encodeRewards(proposers.map((p) => (p === alice ? 0n : 450n))),
     })
-    const rewards = await readCalculatorRewards(baseInput(client, [...ours, other]))
+    const rewards = await readCalculatorRewards(baseInput(client, [...ours, other], stableTimeline))
 
     expect([...rewards.entries()]).toEqual([[10n, 0n], [11n, 450n], [12n, 450n]])
     expect(call).toHaveBeenCalledTimes(1)
@@ -100,12 +111,77 @@ describe("sequencer reward calculator", () => {
     expect(readContract.mock.calls[0]![0]).toMatchObject({ args: [12n], blockNumber: 102n })
   })
 
+  it("resolves a window that spans a calculator install: default before, calculator after", async () => {
+    const early = checkpoint(4n, 80n, alice)
+    const late = [checkpoint(10n, 100n, bob), checkpoint(11n, 101n, carol)]
+    const { client, call } = fixture({
+      proofs: [{ tip: 5n, block: 95n }, { tip: 11n, block: 120n }],
+      rewards: (proposers) => encodeRewards(proposers.map(() => 100n)),
+    })
+    const rewards = await readCalculatorRewards(baseInput(client, [early, ...late], installTimeline))
+
+    // The proof before the install pays the default without any calculator call.
+    expect([...rewards.entries()]).toEqual([[4n, DEFAULT], [10n, 100n], [11n, 100n]])
+    expect(call).toHaveBeenCalledTimes(1)
+    const { args } = decodeFunctionData({ abi: CALCULATOR_ABI, data: call.mock.calls[0]![0].data })
+    expect(args[1]).toEqual([bob, carol])
+  })
+
+  it("uses the replacement calculator for proofs after a second change", async () => {
+    const timeline: CalculatorTimeline = {
+      initial: calculator,
+      changes: [{ blockNumber: 105n, oldCalculator: calculator, newCalculator: replacement }],
+    }
+    const { client, call } = fixture({
+      proofs: [{ tip: 5n, block: 100n }, { tip: 11n, block: 120n }],
+      rewards: () => encodeRewards([100n]),
+    })
+    await readCalculatorRewards(baseInput(client, [checkpoint(3n, 80n, alice), checkpoint(10n, 100n, bob)], timeline))
+    // The proof before the change replays against the original calculator,
+    // the one after it against the replacement.
+    expect(call).toHaveBeenCalledTimes(2)
+    expect(call.mock.calls.map(([r]) => [r.blockNumber, r.to])).toEqual([
+      [100n, calculator],
+      [120n, replacement],
+    ])
+  })
+
+  it("calculatorInEffectAt applies the newest change strictly before the proof block", () => {
+    const timeline: CalculatorTimeline = {
+      initial: ZERO_ADDRESS as Address,
+      changes: [
+        { blockNumber: 100n, oldCalculator: ZERO_ADDRESS as Address, newCalculator: calculator },
+        { blockNumber: 150n, oldCalculator: calculator, newCalculator: replacement },
+      ],
+    }
+    expect(calculatorInEffectAt(timeline, 99n)).toBe(ZERO_ADDRESS)
+    expect(calculatorInEffectAt(timeline, 100n)).toBe(ZERO_ADDRESS) // same block: refused elsewhere, never resolved
+    expect(calculatorInEffectAt(timeline, 101n)).toBe(calculator)
+    expect(calculatorInEffectAt(timeline, 150n)).toBe(calculator)
+    expect(calculatorInEffectAt(timeline, 151n)).toBe(replacement)
+  })
+
+  it("scanCalculatorChanges parses the change events of the window", async () => {
+    const client = {
+      getLogs: vi.fn(async (q: { fromBlock: bigint; toBlock: bigint }) =>
+        [
+          { blockNumber: 105n, args: { oldCalculator: ZERO_ADDRESS, newCalculator: calculator } },
+          { blockNumber: 160n, args: { oldCalculator: calculator, newCalculator: ZERO_ADDRESS } },
+        ].filter((e) => e.blockNumber >= q.fromBlock && e.blockNumber <= q.toBlock)),
+    } as unknown as PublicClient
+    const changes = await scanCalculatorChanges({ client, rollupAddress: rollup, fromBlock: 90n, toBlock: 200n, logChunkSize: 50n })
+    expect(changes).toEqual([
+      { blockNumber: 105n, oldCalculator: ZERO_ADDRESS, newCalculator: calculator },
+      { blockNumber: 160n, oldCalculator: calculator, newCalculator: ZERO_ADDRESS },
+    ])
+  })
+
   it("splits checkpoints by the proof that covered them", async () => {
     const { client, call } = fixture({
       proofs: [{ tip: 5n, block: 100n }, { tip: 9n, block: 150n }],
       rewards: () => encodeRewards([DEFAULT]),
     })
-    await readCalculatorRewards(baseInput(client, [checkpoint(3n, 80n, alice), checkpoint(7n, 140n, bob)]))
+    await readCalculatorRewards(baseInput(client, [checkpoint(3n, 80n, alice), checkpoint(7n, 140n, bob)], stableTimeline))
     expect(call.mock.calls.map(([r]) => r.blockNumber)).toEqual([100n, 150n])
   })
 
@@ -113,7 +189,7 @@ describe("sequencer reward calculator", () => {
     const { client } = fixture({
       proofs: [{ tip: 10n, block: 100n }], calculatorError: reverted(),
     })
-    const rewards = await readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)]))
+    const rewards = await readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)], stableTimeline))
     expect([...rewards.values()]).toEqual([DEFAULT])
   })
 
@@ -121,30 +197,30 @@ describe("sequencer reward calculator", () => {
     const { client } = fixture({
       proofs: [{ tip: 10n, block: 100n }], calculatorError: outOfGas(),
     })
-    const rewards = await readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)]))
+    const rewards = await readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)], stableTimeline))
     expect([...rewards.values()]).toEqual([DEFAULT])
   })
 
   it("rejects malformed or out-of-bounds responses by falling back to the default", async () => {
     // A response sized for a different proposer count than the proof's.
     const short = fixture({ proofs: [{ tip: 10n, block: 100n }], rewards: () => "0x1234" })
-    expect([...(await readCalculatorRewards(baseInput(short.client, [checkpoint(10n, 90n, alice)]))).values()])
+    expect([...(await readCalculatorRewards(baseInput(short.client, [checkpoint(10n, 90n, alice)], stableTimeline))).values()])
       .toEqual([DEFAULT])
 
     const huge = fixture({ proofs: [{ tip: 10n, block: 100n }], rewards: () => encodeRewards([10n ** 30n]) })
-    expect([...(await readCalculatorRewards(baseInput(huge.client, [checkpoint(10n, 90n, alice)]))).values()])
+    expect([...(await readCalculatorRewards(baseInput(huge.client, [checkpoint(10n, 90n, alice)], stableTimeline))).values()])
       .toEqual([DEFAULT])
   })
 
   it("rethrows transport failures instead of silently paying the default", async () => {
     const { client } = fixture({ proofs: [{ tip: 10n, block: 100n }], calculatorError: new Error("ECONNRESET") })
-    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)])))
+    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)], stableTimeline)))
       .rejects.toThrow(/ECONNRESET/)
   })
 
   it("refuses a checkpoint that no proof covers", async () => {
     const { client } = fixture({ proofs: [{ tip: 5n, block: 100n }], rewards: () => encodeRewards([DEFAULT]) })
-    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)])))
+    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)], stableTimeline)))
       .rejects.toThrow(/No L2ProofVerified event covers checkpoint 10/)
   })
 
@@ -154,7 +230,17 @@ describe("sequencer reward calculator", () => {
       rewards: () => encodeRewards([DEFAULT]),
       calculatorEvents: [{ block: 100n }],
     })
-    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)])))
+    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)], stableTimeline)))
       .rejects.toThrow(/same block as an epoch proof paying this window/)
+  })
+
+  it("refuses a window when the rollup swaps the calculator in a paying proof's block", async () => {
+    const sameBlockInstall: CalculatorTimeline = {
+      initial: ZERO_ADDRESS as Address,
+      changes: [{ blockNumber: 100n, oldCalculator: ZERO_ADDRESS as Address, newCalculator: calculator }],
+    }
+    const { client } = fixture({ proofs: [{ tip: 10n, block: 100n }], rewards: () => encodeRewards([DEFAULT]) })
+    await expect(readCalculatorRewards(baseInput(client, [checkpoint(10n, 90n, alice)], sameBlockInstall)))
+      .rejects.toThrow(/changed to .* in block 100, the same block as an epoch proof/)
   })
 })
